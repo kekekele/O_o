@@ -27,9 +27,9 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.0001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--temperature', default=0.2, type=int)
+    parser.add_argument('--seed', default=2025, type=int)
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
@@ -38,11 +38,14 @@ def get_args():
     parser.add_argument('--num_epochs', default=1, type=int)
     parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
-    parser.add_argument('--l2_emb', default=0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', default=True, action='store_true')
+    parser.add_argument('--norm_first', default=False, action='store_true')
+
+    # Loss
+    parser.add_argument('--loss_type', default='listwise', choices=['listwise', 'bce'])
+    parser.add_argument('--logit_temperature', default=0.5, type=float)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])

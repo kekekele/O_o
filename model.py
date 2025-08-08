@@ -7,18 +7,6 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
@@ -100,7 +88,7 @@ class PointWiseFeedForward(torch.nn.Module):
         self.dropout2 = torch.nn.Dropout(p=dropout_rate)
 
         # Swish/SiLU 激活函数，用于门控
-        self.swish = torch.nn.SiLU()
+        self.swish = torch.nn.SiLU()  # 或者 F.silu
 
     def forward(self, inputs):
         """
@@ -151,7 +139,6 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
-        self.temperature = args.temperature
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
@@ -162,9 +149,9 @@ class BaselineModel(torch.nn.Module):
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
 
-        self.attention_norms = torch.nn.ModuleList()  # to be Q for self-attention
+        self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
         self.attention_layers = torch.nn.ModuleList()
-        self.forward_norms = torch.nn.ModuleList()
+        self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
 
         self._init_feat_info(feat_statistics, feat_types)
@@ -181,19 +168,19 @@ class BaselineModel(torch.nn.Module):
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
 
-        self.last_norm = RMSNorm(args.hidden_units, eps=1e-8)
+        self.last_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
-            new_attn_norm = RMSNorm(args.hidden_units, eps=1e-8)
-            self.attention_norms.append(new_attn_norm)
+            new_attn_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
+            self.attention_layernorms.append(new_attn_layernorm)
 
             new_attn_layer = FlashMultiHeadAttention(
                 args.hidden_units, args.num_heads, args.dropout_rate
             )  # 优化：用FlashAttention替代标准Attention
             self.attention_layers.append(new_attn_layer)
 
-            new_fwd_norm = RMSNorm(args.hidden_units, eps=1e-8)
-            self.forward_norms.append(new_fwd_norm)
+            new_fwd_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
+            self.forward_layernorms.append(new_fwd_layernorm)
 
             new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
             self.forward_layers.append(new_fwd_layer)
@@ -363,7 +350,7 @@ class BaselineModel(torch.nn.Module):
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
-        seqs *= self.item_emb.embedding_dim**0.5
+        seqs *= self.userdnn.out_features**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= log_seqs != 0
         seqs += self.pos_emb(poss)
@@ -377,16 +364,16 @@ class BaselineModel(torch.nn.Module):
 
         for i in range(len(self.attention_layers)):
             if self.norm_first:
-                x = self.attention_norms[i](seqs)
+                x = self.attention_layernorms[i](seqs)
                 mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
                 seqs = seqs + mha_outputs
-                seqs = seqs + self.forward_layers[i](self.forward_norms[i](seqs))
+                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
                 mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_norms[i](seqs + mha_outputs)
-                seqs = self.forward_norms[i](seqs + self.forward_layers[i](seqs))
+                seqs = self.attention_layernorms[i](seqs + mha_outputs)
+                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
-        log_feats = self.last_norm(seqs)
+        log_feats = self.last_layernorm(seqs)
 
         return log_feats
 
@@ -417,33 +404,12 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        # pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        # neg_logits = (log_feats * neg_embs).sum(dim=-1)
+        pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        neg_logits = (log_feats * neg_embs).sum(dim=-1)
+        pos_logits = pos_logits * loss_mask
+        neg_logits = neg_logits * loss_mask
 
-        log_feats = F.normalize(log_feats, dim=-1)
-        pos_embs = F.normalize(pos_embs, dim=-1)
-        neg_embs = F.normalize(neg_embs, dim=-1)
-
-        # 计算正样本得分
-        pos_score = (log_feats * pos_embs).sum(dim=-1)  # [batch_size, maxlen]
-        pos_score = torch.exp(pos_score / self.temperature)
-
-        # 计算负样本得分矩阵
-        # log_feats: [batch_size, maxlen, dim]
-        # neg_embs: [batch_size, maxlen, dim]
-        # ttl_score: [batch_size, maxlen, maxlen] (每个正样本与所有负样本的相似度)
-        ttl_score = torch.bmm(log_feats, neg_embs.transpose(1, 2))      # [batch_size, maxlen, maxlen]
-        ttl_score = torch.exp(ttl_score / self.temperature).sum(dim=-1) # [batch_size, maxlen]
-
-        # 计算softmax损失
-        loss = -torch.log(pos_score / (ttl_score + pos_score) + 1e-6)
-
-        loss = (loss * loss_mask).mean()
-        return loss
-
-        # pos_logits = pos_logits * loss_mask
-        # neg_logits = neg_logits * loss_mask
-        # return pos_logits, neg_logits
+        return pos_logits, neg_logits
 
     def predict(self, log_seqs, seq_feature, mask):
         """

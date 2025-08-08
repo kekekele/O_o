@@ -435,6 +435,43 @@ def save_emb(emb, save_path):
         f.write(struct.pack('II', num_points, num_dimensions))
         emb.tofile(f)
 
+# def load_mm_emb(mm_path, feat_ids):
+#     """
+#     加载多模态特征Embedding
+#
+#     Args:
+#         mm_path: 多模态特征Embedding路径
+#         feat_ids: 要加载的多模态特征ID列表
+#
+#     Returns:
+#         mm_emb_dict: 多模态特征Embedding字典，key为特征ID，value为特征Embedding字典（key为item ID，value为Embedding）
+#     """
+#     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
+#     mm_emb_dict = {}
+#     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
+#         shape = SHAPE_DICT[feat_id]
+#         emb_dict = {}
+#         if feat_id != '81':
+#             try:
+#                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
+#                 for json_file in base_path.glob('*.json'):
+#                     with open(json_file, 'r', encoding='utf-8') as file:
+#                         for line in file:
+#                             data_dict_origin = json.loads(line.strip())
+#                             insert_emb = data_dict_origin['emb']
+#                             if isinstance(insert_emb, list):
+#                                 insert_emb = np.array(insert_emb, dtype=np.float32)
+#                             data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
+#                             emb_dict.update(data_dict)
+#             except Exception as e:
+#                 print(f"transfer error: {e}")
+#         if feat_id == '81':
+#             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
+#                 emb_dict = pickle.load(f)
+#         mm_emb_dict[feat_id] = emb_dict
+#         print(f'Loaded #{feat_id} mm_emb')
+#     return mm_emb_dict
+
 
 def load_mm_emb(mm_path, feat_ids):
     """
