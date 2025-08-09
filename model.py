@@ -153,6 +153,7 @@ class BaselineModel(torch.nn.Module):
         self.attention_layers = torch.nn.ModuleList()
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
+        self.loss_type = args.loss_type
 
         self._init_feat_info(feat_statistics, feat_types)
 
@@ -350,7 +351,7 @@ class BaselineModel(torch.nn.Module):
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
-        seqs *= self.userdnn.out_features**0.5
+        seqs *= self.user_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= log_seqs != 0
         seqs += self.pos_emb(poss)
@@ -404,12 +405,15 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
+        if self.loss_type in ['infonce', 'batchsoftmax']:
+            return pos_embs, neg_embs, log_feats
+        else:
+            pos_logits = (log_feats * pos_embs).sum(dim=-1)
+            neg_logits = (log_feats * neg_embs).sum(dim=-1)
+            pos_logits = pos_logits * loss_mask
+            neg_logits = neg_logits * loss_mask
 
-        return pos_logits, neg_logits
+            return pos_logits, neg_logits
 
     def predict(self, log_seqs, seq_feature, mask):
         """

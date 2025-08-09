@@ -21,10 +21,10 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--lr', default=0.0001, type=float)
+    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--seed', default=2025, type=int)
+    parser.add_argument('--seed', default=20252026, type=int)
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
@@ -36,11 +36,11 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', default=False, action='store_true')
+    parser.add_argument('--norm_first', default=True, action='store_true')
 
     # Loss
-    parser.add_argument('--loss_type', default='listwise', choices=['listwise', 'bce'])
-    parser.add_argument('--logit_temperature', default=0.5, type=float)
+    parser.add_argument('--loss_type', default='bce', choices=['batchsoftmax', 'bce', 'infonce'])
+    parser.add_argument('--temperature', default=0.2, type=float)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -80,31 +80,58 @@ def init_weights(m: torch.nn.Module):
         if hasattr(m, 'bias') and m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
-def listwise_loss_from_logits(pos_logits: torch.Tensor,
-                              neg_logits: torch.Tensor,
-                              next_token_type: torch.Tensor,
-                              temperature: float = 1.0) -> torch.Tensor:
-    device = pos_logits.device
-    if neg_logits.dim() == 2:
-        scores = torch.stack([pos_logits, neg_logits], dim=-1)  # [B, L, 2]
-    elif neg_logits.dim() == 3:
-        scores = torch.cat([pos_logits.unsqueeze(-1), neg_logits], dim=-1)  # [B, L, N+1]
-    else:
-        raise ValueError(f"Unexpected neg_logits dim: {neg_logits.dim()}")
+def BatchSoftmax(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor):
+    # 选出参与训练的位置
+    mask = (next_token_type == 1)
+    if mask.dtype != torch.bool:
+        mask = mask.to(torch.bool)
 
-    if temperature != 1.0:
-        scores = scores / temperature
+    # 直接按 mask 筛选出 [M, D]
+    pos_embs = pos_embs[mask]
+    log_feats = log_feats[mask]
 
-    if not torch.is_tensor(next_token_type):
-        next_token_type = torch.as_tensor(next_token_type, device=device)
-    mask = (next_token_type == 1).to(device)  # [B, L] bool
-    scores_masked = scores[mask]
-    if scores_masked.numel() == 0:
-        return torch.zeros((), device=device)
+    pos_score = (log_feats * pos_embs).sum(dim=-1)
+    pos_score = torch.exp(pos_score / temperature)
+    ttl_score = torch.matmul(pos_embs, log_feats.transpose(0, 1))
+    ttl_score = torch.exp(ttl_score / temperature).sum(dim=1)
+    loss = -torch.log(pos_score / ttl_score + 10e-6)
+    return torch.mean(loss)
 
-    targets = torch.zeros(scores_masked.size(0), dtype=torch.long, device=device)  # 索引0为正样本
-    loss = F.cross_entropy(scores_masked, targets, reduction='mean')
-    return loss
+
+def InfoNCE(pos_embs, neg_embs, log_feats, temperature: float, next_token_type: torch.Tensor):
+    """
+    Args:
+        pos_embs: (torch.Tensor - N x L × D)
+        neg_embs: (torch.Tensor - N x L × D)
+        log_feats: (torch.Tensor - N x L × D)
+        temperature: float
+
+    Return: Average InfoNCE Loss
+    """
+    # 选出参与训练的位置
+    mask = (next_token_type == 1)
+    if mask.dtype != torch.bool:
+        mask = mask.to(torch.bool)
+
+    # 直接按 mask 筛选出 [M, D]
+    pos_embs = pos_embs[mask]
+    log_feats = log_feats[mask]
+    neg_embs = neg_embs[mask]
+
+    # 计算正样本得分
+    pos_score = (log_feats * pos_embs).sum(dim=-1)  # [M]
+    pos_score = torch.exp(pos_score / temperature)
+
+    # 计算负样本得分矩阵
+    # log_feats: [M, D]
+    # neg_embs: [M, D]
+    # ttl_score: [M] (每个正样本与所有负样本的相似度)
+    ttl_score = torch.matmul(log_feats, neg_embs.transpose(-1, -2))  # [M, M]
+    ttl_score = torch.exp(ttl_score / temperature).sum(dim=-1)  # [M]
+
+    # 计算softmax损失
+    loss = -torch.log(pos_score / (ttl_score + pos_score + 1e-6))
+    return torch.mean(loss)
 
 
 if __name__ == '__main__':
@@ -177,7 +204,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
     T_total = len(train_loader) * args.num_epochs
     num_warmup_steps = int(T_total * 0.1)
-    warmup_scheduler = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=num_warmup_steps)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=num_warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
 
@@ -201,15 +228,24 @@ if __name__ == '__main__':
                 token_type = token_type.to(device)
                 next_token_type = next_token_type.to(device)
 
-                pos_logits, neg_logits = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                )
-
-                if args.loss_type == 'listwise':
-                    loss = listwise_loss_from_logits(
-                        pos_logits, neg_logits, next_token_type, temperature=args.logit_temperature
+                if args.loss_type == 'infonce':
+                    pos_embs, neg_embs, log_feats = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                     )
-                else:
+                    loss = InfoNCE(
+                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                    )
+                elif args.loss_type == 'batchsoftmax':
+                    pos_embs, neg_embs, log_feats = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    )
+                    loss = BatchSoftmax(
+                        pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                    )
+                elif args.loss_type == 'bce':
+                    pos_logits, neg_logits = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    )
                     bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
                     mask = (next_token_type == 1)
                     pos_labels = torch.ones_like(pos_logits, device=device)
@@ -247,15 +283,24 @@ if __name__ == '__main__':
                     token_type = token_type.to(device)
                     next_token_type = next_token_type.to(device)
 
-                    pos_logits, neg_logits = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                    )
-
-                    if args.loss_type == 'listwise':
-                        loss = listwise_loss_from_logits(
-                            pos_logits, neg_logits, next_token_type, temperature=args.logit_temperature
+                    if args.loss_type == 'infonce':
+                        pos_embs, neg_embs, log_feats = model(
+                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                         )
-                    else:
+                        loss = InfoNCE(
+                            pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                        )
+                    elif args.loss_type == 'batchsoftmax':
+                        pos_embs, neg_embs, log_feats = model(
+                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                        )
+                        loss = BatchSoftmax(
+                            pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                        )
+                    elif args.loss_type == 'bce':
+                        pos_logits, neg_logits = model(
+                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                        )
                         bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
                         mask = (next_token_type == 1)
                         pos_labels = torch.ones_like(pos_logits, device=device)
@@ -273,77 +318,73 @@ if __name__ == '__main__':
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
 
-            if valid_loss_avg < best_val_loss:
-                best_val_loss = valid_loss_avg
-                torch.save(model.state_dict(), save_dir / "best_model.pt")
-
-        # ===== 额外步骤：用验证集训练一轮（fine-tune）=====
-        # 可复现的乱序 DataLoader（验证集）
-        valid_train_loader = DataLoader(
-            valid_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,  # 训练用 shuffle
-            num_workers=num_workers,
-            worker_init_fn=worker_init_fn if num_workers > 0 else None,
-            collate_fn=dataset.collate_fn,
-            generator=torch.Generator().manual_seed(args.seed + 1),  # 可复现
-        )
-
-        model.train()
-        finetune_step = 0
-
-        # 如需单独的微调学习率（例如降低10倍），可解除注释：
-        # for pg in optimizer.param_groups:
-        #     pg['lr'] = 1e-5
-
-        print("Start fine-tuning on validation set for 1 epoch")
-        for step, batch in tqdm(enumerate(valid_train_loader), total=len(valid_train_loader)):
-            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
-            device = args.device
-            seq = seq.to(device)
-            pos = pos.to(device)
-            neg = neg.to(device)
-            token_type = token_type.to(device)
-            next_token_type = next_token_type.to(device)
-
-            pos_logits, neg_logits = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-            )
-
-            if args.loss_type == 'listwise':
-                loss = listwise_loss_from_logits(
-                    pos_logits, neg_logits, next_token_type, temperature=args.logit_temperature
-                )
-            else:
-                bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                mask = (next_token_type == 1)
-                pos_labels = torch.ones_like(pos_logits, device=device)
-                neg_labels = torch.zeros_like(neg_logits, device=device)
-                loss = bce_criterion(pos_logits[mask], pos_labels[mask])
-                loss += bce_criterion(neg_logits[mask], neg_labels[mask])
-
-            log_json = json.dumps(
-                {'global_step': global_step, 'fine_tune_step': finetune_step, 'loss': float(loss.item()),
-                 'phase': 'finetune_valid', 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
-            )
-            print(log_json)
-            log_file.write(log_json + '\n')
-            log_file.flush()
-            writer.add_scalar('Loss/finetune_valid', loss.item(), global_step)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            finetune_step += 1
-            global_step += 1
+        # # ===== 额外步骤：用验证集训练一轮（fine-tune）=====
+        # # 可复现的乱序 DataLoader（验证集）
+        # valid_train_loader = DataLoader(
+        #     valid_dataset,
+        #     batch_size=args.batch_size,
+        #     shuffle=True,  # 训练用 shuffle
+        #     num_workers=num_workers,
+        #     worker_init_fn=worker_init_fn if num_workers > 0 else None,
+        #     collate_fn=dataset.collate_fn,
+        #     generator=torch.Generator().manual_seed(args.seed + 1),  # 可复现
+        # )
+        #
+        # model.train()
+        # finetune_step = 0
+        #
+        # # 如需单独的微调学习率（例如降低10倍），可解除注释：
+        # # for pg in optimizer.param_groups:
+        # #     pg['lr'] = 1e-5
+        #
+        # print("Start fine-tuning on validation set for 1 epoch")
+        # for step, batch in tqdm(enumerate(valid_train_loader), total=len(valid_train_loader)):
+        #     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+        #     device = args.device
+        #     seq = seq.to(device)
+        #     pos = pos.to(device)
+        #     neg = neg.to(device)
+        #     token_type = token_type.to(device)
+        #     next_token_type = next_token_type.to(device)
+        #
+        #     pos_logits, neg_logits = model(
+        #         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+        #     )
+        #
+        #     if args.loss_type == 'listwise':
+        #         loss = listwise_loss_from_logits(
+        #             pos_logits, neg_logits, next_token_type, temperature=args.temperature
+        #         )
+        #     else:
+        #         bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+        #         mask = (next_token_type == 1)
+        #         pos_labels = torch.ones_like(pos_logits, device=device)
+        #         neg_labels = torch.zeros_like(neg_logits, device=device)
+        #         loss = bce_criterion(pos_logits[mask], pos_labels[mask])
+        #         loss += bce_criterion(neg_logits[mask], neg_labels[mask])
+        #
+        #     log_json = json.dumps(
+        #         {'global_step': global_step, 'fine_tune_step': finetune_step, 'loss': float(loss.item()),
+        #          'phase': 'finetune_valid', 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
+        #     )
+        #     print(log_json)
+        #     log_file.write(log_json + '\n')
+        #     log_file.flush()
+        #     writer.add_scalar('Loss/finetune_valid', loss.item(), global_step)
+        #
+        #     optimizer.zero_grad(set_to_none=True)
+        #     loss.backward()
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        #     optimizer.step()
+        #
+        #     finetune_step += 1
+        #     global_step += 1
 
         # 保存最终模型（fine-tune 后）
-        final_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"final_after_finetune_step{global_step}")
-        final_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), final_dir / "final_model.pt")
-        print(f"Fine-tuning done. Final model saved to: {final_dir}")
+        # final_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"final_after_finetune_step{global_step}")
+        # final_dir.mkdir(parents=True, exist_ok=True)
+        # torch.save(model.state_dict(), final_dir / "final_model.pt")
+        # print(f"Fine-tuning done. Final model saved to: {final_dir}")
 
     print("Done")
     writer.close()
