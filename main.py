@@ -29,19 +29,18 @@ def get_args():
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
     parser.add_argument('--hidden_units', default=512, type=int)
-    parser.add_argument('--num_blocks', default=8, type=int)
+    parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_epochs', default=5, type=int)
-    parser.add_argument('--num_heads', default=8, type=int)
+    parser.add_argument('--num_heads', default=4, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', default=False, action='store_true')
-    parser.add_argument('--num_negatives', default=256, action='store_true')
 
-    # Loss
-    parser.add_argument('--loss_type', default='infonce', choices=['batchsoftmax', 'bce', 'infonce'])
-    parser.add_argument('--temperature', default=0.2, type=float)
+    parser.add_argument('--num_negatives', default=1024, action='store_true')
+    parser.add_argument('--loss_type', default='infonce_neg', choices=['infonce_pos', 'bce', 'infonce_neg'])
+    parser.add_argument('--temperature', default=0.07, type=float)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -81,22 +80,7 @@ def init_weights(m: torch.nn.Module):
         if hasattr(m, 'bias') and m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
-def BatchSoftmax(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor):
-    # 选出参与训练的位置
-    mask = (next_token_type == 1)
-    if mask.dtype != torch.bool:
-        mask = mask.to(torch.bool)
-
-    # 直接按 mask 筛选出 [M, D]
-    pos_embs = pos_embs[mask]
-    log_feats = log_feats[mask]
-
-    pos_score = (log_feats @ pos_embs.T) / temperature
-    score = torch.diag(F.log_softmax(pos_score, dim=1))
-    return -score.mean()
-
-
-def InfoNCE(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor, num_negatives=128):
+def InfoNCE_pos(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor, num_negatives=128):
     """
     In-batch InfoNCE with vectorized random negative sampling (no Python loops).
 
@@ -150,79 +134,51 @@ def InfoNCE(pos_embs, log_feats, temperature: float, next_token_type: torch.Tens
     loss = F.cross_entropy(logits, labels)
     return loss
 
-def psl_inbatch_loss(
-    pos_embs: torch.Tensor,
-    log_feats: torch.Tensor,
-    temperature: float,
-    next_token_type: torch.Tensor,
-    num_negatives: int = 128,
+def InfoNCE_neg(
+    pos_embs: torch.Tensor,           # [B, L, D]
+    neg_embs: torch.Tensor,           # [B, L, D]
+    log_feats: torch.Tensor,          # [B, L, D]
+    temperature: float,               # > 0
+    next_token_type: torch.Tensor,    # [B, L]，1 表示 item
+    num_negatives: int = 1024,
 ) -> torch.Tensor:
-    """
-    基于批内负样本的 Pairwise Softmax (PSL1) 损失。
-
-    参数:
-    - pos_embs: Tensor, 形状 (B, D)
-        每个样本对应的正样本向量（如目标 item embedding）。
-    - log_feats: Tensor, 形状 (B, D)
-        每个样本对应的上下文/用户向量（如序列表征）。
-    - temperature: float
-        温度系数 τ，用于缩放相似度；应为正数。
-    - next_token_type: Tensor, 形状 (B,)
-        用于选择参与损失计算的样本的掩码/标记。
-        - 若为 bool/uint8，则 True/非零表示参与计算；
-        - 若为整型/浮点，则 >0 表示参与计算。
-    - num_negatives: int, 默认 128
-        每个样本采样的负样本数量，取自本批其它样本的正样本。
-        若 num_negatives >= (有效样本数 - 1)，则使用“全量其它样本”为负样本。
-
-    返回:
-    - loss: Tensor, 标量
-        批量平均的 PSL1 损失。
-    """
+    assert temperature > 0.0, "temperature must be > 0"
     mask = (next_token_type == 1)
-    if mask.dtype != torch.bool:
+    if mask.dtype is not torch.bool:
         mask = mask.bool()
 
-    pos_embs = pos_embs[mask]  # [M, D]
-    log_feats = log_feats[mask]  # [M, D]
-    M = pos_embs.size(0)
-    device = pos_embs.device
+    Q   = log_feats[mask]   # [M, D]
+    Kp  = pos_embs[mask]    # [M, D]
+    Knp = neg_embs[mask]    # [M, D] 作为负样本池
+    device = Q.device
 
-    if M <= 1:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+    M = Q.size(0)
+    if M == 0:
+        return torch.zeros((), device=device)
 
+    # 从负样本池中采样 K 个负样本（共享池，显存友好）
+    pool_size = Knp.size(0)
+    K = num_negatives
+    if pool_size == 0:
+        # 没有负样本可用，退化为仅正样本（loss 会为 0）
+        pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature
+        labels = torch.zeros(M, dtype=torch.long, device=device)
+        return F.cross_entropy(pos_logits, labels, reduction='mean')
 
-    # 正样本分数: s_pos = cos(u_i, v_i) / τ
-    s_pos = (log_feats * pos_embs).sum(dim=-1) / temperature  # (M,)
-
-    # 负样本索引（批内其它样本的正样本）
-    N = min(int(num_negatives), M - 1)
-    row = torch.arange(M, device=device).unsqueeze(1)  # (M,1)
-
-    if N == M - 1:
-        # 使用全量其它样本作为负样本
-        base = torch.arange(M - 1, device=device).unsqueeze(0).expand(M, -1)  # (M, M-1)
-        neg_idx = base + (base >= row)  # (M, M-1)，跳过对角（自身）
+    if K <= pool_size:
+        neg_idx = torch.randperm(pool_size, device=device)[:K]            # 无放回
     else:
-        # 随机采样 N 个负样本（可重复）
-        base = torch.randint(0, M - 1, (M, N), device=device)                 # (M, N) in [0, M-2]
-        neg_idx = base + (base >= row)                                        # 映射到 [0, M-1] 去掉自身
+        # 池子不够大，允许有放回采样
+        neg_idx = torch.randint(0, pool_size, (K,), device=device)        # 有放回
+    Kn = Knp[neg_idx]                                                     # [K, D]
 
-    # 负样本分数
-    neg_embs = pos_embs[neg_idx]                                # (M, N, D)
-    s_neg = (log_feats.unsqueeze(1) * neg_embs).sum(dim=-1)      # (M, N)
-    s_neg = s_neg / temperature                          # (M, N)
+    # 计算 logits
+    pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature         # [M, 1]
+    neg_logits = (Q @ Kn.t()) / temperature                               # [M, K]
 
-    # 成对差分
-    d = s_neg - s_pos.unsqueeze(1)  # (M, N)
-
-    # PSL1 激活 σ(d) = log(relu(d) + 1)，加上数值下限避免 -inf
-    s = torch.log(torch.relu(d) + 1.0) # (B, N)
-
-    # 聚合（tau_star 取 1.0）
-    loss_per_sample = torch.logsumexp(s, dim=1)  # (B,)
-    loss = loss_per_sample.mean()
-
+    logits = torch.cat([pos_logits, neg_logits], dim=1)                   # [M, 1+K]
+    labels = torch.zeros(M, dtype=torch.long, device=device)              # 正例在第0列
+    loss = F.cross_entropy(logits, labels, reduction='mean')
     return loss
 
 if __name__ == '__main__':
@@ -319,20 +275,29 @@ if __name__ == '__main__':
                 token_type = token_type.to(device)
                 next_token_type = next_token_type.to(device)
 
-                if args.loss_type == 'infonce':
+                if args.loss_type == 'infonce_pos':
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                     )
-                    loss = InfoNCE(
+                    loss = InfoNCE_pos(
                         pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type, num_negatives=args.num_negatives
                     )
-                elif args.loss_type == 'batchsoftmax':
+                elif args.loss_type == 'infonce_neg':
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                     )
-                    loss = BatchSoftmax(
-                        pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                    loss = InfoNCE_neg(
+                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                        num_negatives=args.num_negatives
                     )
+                    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+                    mask = (next_token_type == 1)
+                    pos_logits = (log_feats * pos_embs).sum(dim=-1)
+                    neg_logits = (log_feats * neg_embs).sum(dim=-1)
+                    pos_labels = torch.ones_like(pos_logits, device=device)
+                    neg_labels = torch.zeros_like(neg_logits, device=device)
+                    loss += bce_criterion(pos_logits[mask], pos_labels[mask])
+                    loss += bce_criterion(neg_logits[mask], neg_labels[mask])
                 elif args.loss_type == 'bce':
                     pos_logits, neg_logits = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
@@ -374,21 +339,31 @@ if __name__ == '__main__':
                     token_type = token_type.to(device)
                     next_token_type = next_token_type.to(device)
 
-                    if args.loss_type == 'infonce':
+                    if args.loss_type == 'infonce_pos':
                         pos_embs, neg_embs, log_feats = model(
                             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                         )
-                        loss = InfoNCE(
+                        loss = InfoNCE_pos(
                             pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
                             num_negatives=args.num_negatives
                         )
-                    elif args.loss_type == 'batchsoftmax':
+                    elif args.loss_type == 'infonce_neg':
                         pos_embs, neg_embs, log_feats = model(
                             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                         )
-                        loss = BatchSoftmax(
-                            pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                        loss = InfoNCE_neg(
+                            pos_embs, neg_embs, log_feats, temperature=args.temperature,
+                            next_token_type=next_token_type,
+                            num_negatives=args.num_negatives
                         )
+                        bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+                        mask = (next_token_type == 1)
+                        pos_logits = (log_feats * pos_embs).sum(dim=-1)
+                        neg_logits = (log_feats * neg_embs).sum(dim=-1)
+                        pos_labels = torch.ones_like(pos_logits, device=device)
+                        neg_labels = torch.zeros_like(neg_logits, device=device)
+                        loss += bce_criterion(pos_logits[mask], pos_labels[mask])
+                        loss += bce_criterion(neg_logits[mask], neg_labels[mask])
                     elif args.loss_type == 'bce':
                         pos_logits, neg_logits = model(
                             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat

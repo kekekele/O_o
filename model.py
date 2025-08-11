@@ -340,6 +340,8 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+
+        seqs_emb = F.normalize(seqs_emb, dim=-1)
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):
@@ -380,6 +382,8 @@ class BaselineModel(torch.nn.Module):
 
         log_feats = self.last_layernorm(seqs)
 
+        log_feats = F.normalize(log_feats, dim=-1)
+
         return log_feats
 
     def forward(
@@ -409,7 +413,7 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        if self.loss_type in ['infonce', 'batchsoftmax', 'psl']:
+        if self.loss_type in ['infonce_neg', 'infonce_pos']:
             return pos_embs, neg_embs, log_feats
         else:
             pos_logits = (log_feats * pos_embs).sum(dim=-1)
