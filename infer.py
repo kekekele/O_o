@@ -27,7 +27,7 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.0001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
 
@@ -44,8 +44,8 @@ def get_args():
     parser.add_argument('--norm_first', default=False, action='store_true')
 
     # Loss
-    parser.add_argument('--loss_type', default='infonce', choices=['batchsoftmax', 'bce', 'infonce'])
-    parser.add_argument('--temperature', default=0.1, type=float)
+    parser.add_argument('--loss_type', default='infonce', choices=['infonce_pos', 'bce', 'infonce_neg', 'infonce'])
+    parser.add_argument('--temperature', default=0.07, type=float)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])

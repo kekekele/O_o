@@ -153,7 +153,6 @@ class BaselineModel(torch.nn.Module):
         self.attention_layers = torch.nn.ModuleList()
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
-        self.loss_type = args.loss_type
 
         self._init_feat_info(feat_statistics, feat_types)
 
@@ -173,7 +172,6 @@ class BaselineModel(torch.nn.Module):
                                            torch.nn.ReLU(),
                                            torch.nn.Linear(args.hidden_units, args.hidden_units))
 
-        self.last_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
             new_attn_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
@@ -380,9 +378,7 @@ class BaselineModel(torch.nn.Module):
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
-        log_feats = self.last_layernorm(seqs)
-
-        log_feats = F.normalize(log_feats, dim=-1)
+        log_feats = F.normalize(seqs, dim=-1)
 
         return log_feats
 
@@ -413,15 +409,7 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        if self.loss_type in ['infonce_neg', 'infonce_pos']:
-            return pos_embs, neg_embs, log_feats
-        else:
-            pos_logits = (log_feats * pos_embs).sum(dim=-1)
-            neg_logits = (log_feats * neg_embs).sum(dim=-1)
-            pos_logits = pos_logits * loss_mask
-            neg_logits = neg_logits * loss_mask
-
-            return pos_logits, neg_logits
+        return pos_embs, neg_embs, log_feats
 
     def predict(self, log_seqs, seq_feature, mask):
         """

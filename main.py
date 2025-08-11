@@ -22,25 +22,24 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--lr', default=0.0001, type=float)
+    parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
     parser.add_argument('--hidden_units', default=512, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
-    parser.add_argument('--num_epochs', default=5, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_blocks', default=8, type=int)
+    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', default=False, action='store_true')
 
-    parser.add_argument('--num_negatives', default=1024, action='store_true')
-    parser.add_argument('--loss_type', default='infonce_neg', choices=['infonce_pos', 'bce', 'infonce_neg'])
     parser.add_argument('--temperature', default=0.07, type=float)
+    parser.add_argument('--weight_decay', default=0.0001, type=float)
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -80,104 +79,47 @@ def init_weights(m: torch.nn.Module):
         if hasattr(m, 'bias') and m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
-def InfoNCE_pos(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor, num_negatives=128):
-    """
-    In-batch InfoNCE with vectorized random negative sampling (no Python loops).
-
-    Args:
-        pos_embs       : [B, L, D] 正样本 key embeddings
-        log_feats      : [B, L, D] 查询 query embeddings
-        temperature    : float     温度系数
-        next_token_type: [B, L]    token类型 (1 表示是 item)
-        num_negatives  : int       每个 query 随机采样的负样本数（不含正样本）
-
-    Returns:
-        Scalar Tensor: 平均 InfoNCE loss
-    """
-    # 选出需要参与训练的位置
-    mask = (next_token_type == 1)
-    if mask.dtype != torch.bool:
-        mask = mask.bool()
-
-    pos_embs = pos_embs[mask]   # [M, D]
-    log_feats = log_feats[mask] # [M, D]
-    M = pos_embs.size(0)
-    device = pos_embs.device
-
-    if M <= 1:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    # 全集索引矩阵: [M, M]，每行是所有 key 的编号
-    all_indices = torch.arange(M, device=device)
-    all_indices = all_indices.unsqueeze(0).expand(M, M)  # [M, M]
-
-    # 去掉自身正样本索引
-    mask_self = all_indices != torch.arange(M, device=device).unsqueeze(1)
-    filtered_indices = all_indices[mask_self].view(M, M-1)  # [M, M-1]
-
-    # 对过滤后的索引随机打乱并取前num_negatives
-    perm = torch.argsort(torch.rand(M, M-1, device=device), dim=1)
-    neg_indices = filtered_indices.gather(1, perm[:, :min(num_negatives, M-1)])  # [M, num_negatives]
-
-    # 拼接正样本索引到最前列
-    pos_indices = torch.arange(M, device=device).unsqueeze(1)  # [M, 1]
-    sampled_indices = torch.cat([pos_indices, neg_indices], dim=1)  # [M, 1+num_negatives]
-
-    # 计算相似度：[M, 1+num_negatives]
-    sampled_keys = pos_embs[sampled_indices]  # [M, 1+num_negatives, D]
-    logits = torch.bmm(
-        log_feats.unsqueeze(1),            # [M, 1, D]
-        sampled_keys.transpose(1, 2)       # [M, D, 1+num_negatives]
-    ).squeeze(1) / temperature             # [M, 1+num_negatives]
-
-    labels = torch.zeros(M, dtype=torch.long, device=device)
-    loss = F.cross_entropy(logits, labels)
-    return loss
-
-def InfoNCE_neg(
+def InfoNCE(
     pos_embs: torch.Tensor,           # [B, L, D]
     neg_embs: torch.Tensor,           # [B, L, D]
     log_feats: torch.Tensor,          # [B, L, D]
     temperature: float,               # > 0
     next_token_type: torch.Tensor,    # [B, L]，1 表示 item
-    num_negatives: int = 1024,
 ) -> torch.Tensor:
+    """
+    Batch-all negatives InfoNCE:
+    对每个 query 使用本批次 mask 后的全部负样本作为负例（不降采样）。
+
+    返回：
+        平均交叉熵损失（标注：正样本为第 0 列）
+    """
     assert temperature > 0.0, "temperature must be > 0"
+
     mask = (next_token_type == 1)
     if mask.dtype is not torch.bool:
         mask = mask.bool()
 
+    # 展平后按 mask 取出有效位置
     Q   = log_feats[mask]   # [M, D]
-    Kp  = pos_embs[mask]    # [M, D]
-    Knp = neg_embs[mask]    # [M, D] 作为负样本池
+    Kp  = pos_embs[mask]    # [M, D] 每行对应自己的正样本 key
+    Kneg = neg_embs[mask]   # [M, D] 本批全部负样本池（供所有行共享）
     device = Q.device
 
     M = Q.size(0)
     if M == 0:
         return torch.zeros((), device=device)
 
-    # 从负样本池中采样 K 个负样本（共享池，显存友好）
-    pool_size = Knp.size(0)
-    K = num_negatives
-    if pool_size == 0:
-        # 没有负样本可用，退化为仅正样本（loss 会为 0）
-        pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature
-        labels = torch.zeros(M, dtype=torch.long, device=device)
-        return F.cross_entropy(pos_logits, labels, reduction='mean')
+    # 正样本打分：[M, 1]
+    pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature
 
-    if K <= pool_size:
-        neg_idx = torch.randperm(pool_size, device=device)[:K]            # 无放回
-    else:
-        # 池子不够大，允许有放回采样
-        neg_idx = torch.randint(0, pool_size, (K,), device=device)        # 有放回
-    Kn = Knp[neg_idx]                                                     # [K, D]
+    # 全批负样本打分：[M, M]
+    # 每个 query 与整批负样本池逐一打分
+    neg_logits = (Q @ Kneg.t()) / temperature
 
-    # 计算 logits
-    pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature         # [M, 1]
-    neg_logits = (Q @ Kn.t()) / temperature                               # [M, K]
+    # 拼接：[M, 1 + M]，labels 全为 0（正样本在第 0 列）
+    logits = torch.cat([pos_logits, neg_logits], dim=1)
+    labels = torch.zeros(M, dtype=torch.long, device=device)
 
-    logits = torch.cat([pos_logits, neg_logits], dim=1)                   # [M, 1+K]
-    labels = torch.zeros(M, dtype=torch.long, device=device)              # 正例在第0列
     loss = F.cross_entropy(logits, labels, reduction='mean')
     return loss
 
@@ -248,9 +190,9 @@ if __name__ == '__main__':
             raise RuntimeError(f'failed loading state_dicts: {e}')
 
     # 优化器与调度器
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
     T_total = len(train_loader) * args.num_epochs
-    num_warmup_steps = int(T_total * 0.05)
+    num_warmup_steps = int(T_total * 0.1)
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=num_warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
@@ -275,39 +217,20 @@ if __name__ == '__main__':
                 token_type = token_type.to(device)
                 next_token_type = next_token_type.to(device)
 
-                if args.loss_type == 'infonce_pos':
-                    pos_embs, neg_embs, log_feats = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                    )
-                    loss = InfoNCE_pos(
-                        pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type, num_negatives=args.num_negatives
-                    )
-                elif args.loss_type == 'infonce_neg':
-                    pos_embs, neg_embs, log_feats = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                    )
-                    loss = InfoNCE_neg(
-                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
-                        num_negatives=args.num_negatives
-                    )
-                    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                    mask = (next_token_type == 1)
-                    pos_logits = (log_feats * pos_embs).sum(dim=-1)
-                    neg_logits = (log_feats * neg_embs).sum(dim=-1)
-                    pos_labels = torch.ones_like(pos_logits, device=device)
-                    neg_labels = torch.zeros_like(neg_logits, device=device)
-                    loss += bce_criterion(pos_logits[mask], pos_labels[mask])
-                    loss += bce_criterion(neg_logits[mask], neg_labels[mask])
-                elif args.loss_type == 'bce':
-                    pos_logits, neg_logits = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                    )
-                    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                    mask = (next_token_type == 1)
-                    pos_labels = torch.ones_like(pos_logits, device=device)
-                    neg_labels = torch.zeros_like(neg_logits, device=device)
-                    loss = bce_criterion(pos_logits[mask], pos_labels[mask])
-                    loss += bce_criterion(neg_logits[mask], neg_labels[mask])
+                pos_embs, neg_embs, log_feats = model(
+                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                )
+                loss = InfoNCE(
+                    pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                )
+                bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+                mask = (next_token_type == 1)
+                pos_logits = (log_feats * pos_embs).sum(dim=-1)
+                neg_logits = (log_feats * neg_embs).sum(dim=-1)
+                pos_labels = torch.ones_like(pos_logits, device=device)
+                neg_labels = torch.zeros_like(neg_logits, device=device)
+                loss += bce_criterion(pos_logits[mask], pos_labels[mask])
+                loss += bce_criterion(neg_logits[mask], neg_labels[mask])
 
                 log_json = json.dumps(
                     {'global_step': global_step, 'loss': float(loss.item()), 'epoch': epoch,
@@ -321,8 +244,8 @@ if __name__ == '__main__':
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
                 scheduler.step()
+                optimizer.step()
 
                 global_step += 1
 
@@ -339,41 +262,20 @@ if __name__ == '__main__':
                     token_type = token_type.to(device)
                     next_token_type = next_token_type.to(device)
 
-                    if args.loss_type == 'infonce_pos':
-                        pos_embs, neg_embs, log_feats = model(
-                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                        )
-                        loss = InfoNCE_pos(
-                            pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
-                            num_negatives=args.num_negatives
-                        )
-                    elif args.loss_type == 'infonce_neg':
-                        pos_embs, neg_embs, log_feats = model(
-                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                        )
-                        loss = InfoNCE_neg(
-                            pos_embs, neg_embs, log_feats, temperature=args.temperature,
-                            next_token_type=next_token_type,
-                            num_negatives=args.num_negatives
-                        )
-                        bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                        mask = (next_token_type == 1)
-                        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-                        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-                        pos_labels = torch.ones_like(pos_logits, device=device)
-                        neg_labels = torch.zeros_like(neg_logits, device=device)
-                        loss += bce_criterion(pos_logits[mask], pos_labels[mask])
-                        loss += bce_criterion(neg_logits[mask], neg_labels[mask])
-                    elif args.loss_type == 'bce':
-                        pos_logits, neg_logits = model(
-                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-                        )
-                        bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                        mask = (next_token_type == 1)
-                        pos_labels = torch.ones_like(pos_logits, device=device)
-                        neg_labels = torch.zeros_like(neg_logits, device=device)
-                        loss = bce_criterion(pos_logits[mask], pos_labels[mask])
-                        loss += bce_criterion(neg_logits[mask], neg_labels[mask])
+                    pos_embs, neg_embs, log_feats = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    )
+                    loss = InfoNCE(
+                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                    )
+                    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+                    mask = (next_token_type == 1)
+                    pos_logits = (log_feats * pos_embs).sum(dim=-1)
+                    neg_logits = (log_feats * neg_embs).sum(dim=-1)
+                    pos_labels = torch.ones_like(pos_logits, device=device)
+                    neg_labels = torch.zeros_like(neg_logits, device=device)
+                    loss += bce_criterion(pos_logits[mask], pos_labels[mask])
+                    loss += bce_criterion(neg_logits[mask], neg_labels[mask])
 
                     valid_loss_sum += loss.item()
 
