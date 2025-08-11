@@ -166,8 +166,12 @@ class BaselineModel(torch.nn.Module):
             + args.embedding_dim * len(self.ITEM_EMB_FEAT)
         )
 
-        self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
-        self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
+        self.userdnn = torch.nn.Sequential(torch.nn.Linear(userdim, args.hidden_units),
+                                           torch.nn.ReLU(),
+                                           torch.nn.Linear(args.hidden_units, args.hidden_units))
+        self.itemdnn = torch.nn.Sequential(torch.nn.Linear(itemdim, args.hidden_units),
+                                           torch.nn.ReLU(),
+                                           torch.nn.Linear(args.hidden_units, args.hidden_units))
 
         self.last_layernorm = torch.nn.RMSNorm(args.hidden_units, eps=1e-8)
 
@@ -329,10 +333,10 @@ class BaselineModel(torch.nn.Module):
 
         # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)
-        all_item_emb = torch.relu(self.itemdnn(all_item_emb))
+        all_item_emb = self.itemdnn(all_item_emb)
         if include_user:
             all_user_emb = torch.cat(user_feat_list, dim=2)
-            all_user_emb = torch.relu(self.userdnn(all_user_emb))
+            all_user_emb = self.userdnn(all_user_emb)
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
@@ -405,7 +409,7 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        if self.loss_type in ['infonce', 'batchsoftmax']:
+        if self.loss_type in ['infonce', 'batchsoftmax', 'psl']:
             return pos_embs, neg_embs, log_feats
         else:
             pos_logits = (log_feats * pos_embs).sum(dim=-1)

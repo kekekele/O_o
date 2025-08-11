@@ -22,7 +22,7 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.0001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
 
@@ -30,16 +30,17 @@ def get_args():
     parser.add_argument('--embedding_dim', default=64, type=int)
     parser.add_argument('--hidden_units', default=512, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
-    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_epochs', default=5, type=int)
     parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', default=True, action='store_true')
+    parser.add_argument('--norm_first', default=False, action='store_true')
+    parser.add_argument('--num_negatives', default=256, action='store_true')
 
     # Loss
-    parser.add_argument('--loss_type', default='bce', choices=['batchsoftmax', 'bce', 'infonce'])
+    parser.add_argument('--loss_type', default='infonce', choices=['batchsoftmax', 'bce', 'infonce'])
     parser.add_argument('--temperature', default=0.2, type=float)
 
     # MMemb Feature ID
@@ -90,49 +91,139 @@ def BatchSoftmax(pos_embs, log_feats, temperature: float, next_token_type: torch
     pos_embs = pos_embs[mask]
     log_feats = log_feats[mask]
 
-    pos_score = (log_feats * pos_embs).sum(dim=-1)
-    pos_score = torch.exp(pos_score / temperature)
-    ttl_score = torch.matmul(pos_embs, log_feats.transpose(0, 1))
-    ttl_score = torch.exp(ttl_score / temperature).sum(dim=1)
-    loss = -torch.log(pos_score / ttl_score + 10e-6)
-    return torch.mean(loss)
+    pos_score = (log_feats @ pos_embs.T) / temperature
+    score = torch.diag(F.log_softmax(pos_score, dim=1))
+    return -score.mean()
 
 
-def InfoNCE(pos_embs, neg_embs, log_feats, temperature: float, next_token_type: torch.Tensor):
+def InfoNCE(pos_embs, log_feats, temperature: float, next_token_type: torch.Tensor, num_negatives=128):
     """
+    In-batch InfoNCE with vectorized random negative sampling (no Python loops).
+
     Args:
-        pos_embs: (torch.Tensor - N x L × D)
-        neg_embs: (torch.Tensor - N x L × D)
-        log_feats: (torch.Tensor - N x L × D)
-        temperature: float
+        pos_embs       : [B, L, D] 正样本 key embeddings
+        log_feats      : [B, L, D] 查询 query embeddings
+        temperature    : float     温度系数
+        next_token_type: [B, L]    token类型 (1 表示是 item)
+        num_negatives  : int       每个 query 随机采样的负样本数（不含正样本）
 
-    Return: Average InfoNCE Loss
+    Returns:
+        Scalar Tensor: 平均 InfoNCE loss
     """
-    # 选出参与训练的位置
+    # 选出需要参与训练的位置
     mask = (next_token_type == 1)
     if mask.dtype != torch.bool:
-        mask = mask.to(torch.bool)
+        mask = mask.bool()
 
-    # 直接按 mask 筛选出 [M, D]
-    pos_embs = pos_embs[mask]
-    log_feats = log_feats[mask]
-    neg_embs = neg_embs[mask]
+    pos_embs = pos_embs[mask]   # [M, D]
+    log_feats = log_feats[mask] # [M, D]
+    M = pos_embs.size(0)
+    device = pos_embs.device
 
-    # 计算正样本得分
-    pos_score = (log_feats * pos_embs).sum(dim=-1)  # [M]
-    pos_score = torch.exp(pos_score / temperature)
+    if M <= 1:
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # 计算负样本得分矩阵
-    # log_feats: [M, D]
-    # neg_embs: [M, D]
-    # ttl_score: [M] (每个正样本与所有负样本的相似度)
-    ttl_score = torch.matmul(log_feats, neg_embs.transpose(-1, -2))  # [M, M]
-    ttl_score = torch.exp(ttl_score / temperature).sum(dim=-1)  # [M]
+    # 全集索引矩阵: [M, M]，每行是所有 key 的编号
+    all_indices = torch.arange(M, device=device)
+    all_indices = all_indices.unsqueeze(0).expand(M, M)  # [M, M]
 
-    # 计算softmax损失
-    loss = -torch.log(pos_score / (ttl_score + pos_score + 1e-6))
-    return torch.mean(loss)
+    # 去掉自身正样本索引
+    mask_self = all_indices != torch.arange(M, device=device).unsqueeze(1)
+    filtered_indices = all_indices[mask_self].view(M, M-1)  # [M, M-1]
 
+    # 对过滤后的索引随机打乱并取前num_negatives
+    perm = torch.argsort(torch.rand(M, M-1, device=device), dim=1)
+    neg_indices = filtered_indices.gather(1, perm[:, :min(num_negatives, M-1)])  # [M, num_negatives]
+
+    # 拼接正样本索引到最前列
+    pos_indices = torch.arange(M, device=device).unsqueeze(1)  # [M, 1]
+    sampled_indices = torch.cat([pos_indices, neg_indices], dim=1)  # [M, 1+num_negatives]
+
+    # 计算相似度：[M, 1+num_negatives]
+    sampled_keys = pos_embs[sampled_indices]  # [M, 1+num_negatives, D]
+    logits = torch.bmm(
+        log_feats.unsqueeze(1),            # [M, 1, D]
+        sampled_keys.transpose(1, 2)       # [M, D, 1+num_negatives]
+    ).squeeze(1) / temperature             # [M, 1+num_negatives]
+
+    labels = torch.zeros(M, dtype=torch.long, device=device)
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+def psl_inbatch_loss(
+    pos_embs: torch.Tensor,
+    log_feats: torch.Tensor,
+    temperature: float,
+    next_token_type: torch.Tensor,
+    num_negatives: int = 128,
+) -> torch.Tensor:
+    """
+    基于批内负样本的 Pairwise Softmax (PSL1) 损失。
+
+    参数:
+    - pos_embs: Tensor, 形状 (B, D)
+        每个样本对应的正样本向量（如目标 item embedding）。
+    - log_feats: Tensor, 形状 (B, D)
+        每个样本对应的上下文/用户向量（如序列表征）。
+    - temperature: float
+        温度系数 τ，用于缩放相似度；应为正数。
+    - next_token_type: Tensor, 形状 (B,)
+        用于选择参与损失计算的样本的掩码/标记。
+        - 若为 bool/uint8，则 True/非零表示参与计算；
+        - 若为整型/浮点，则 >0 表示参与计算。
+    - num_negatives: int, 默认 128
+        每个样本采样的负样本数量，取自本批其它样本的正样本。
+        若 num_negatives >= (有效样本数 - 1)，则使用“全量其它样本”为负样本。
+
+    返回:
+    - loss: Tensor, 标量
+        批量平均的 PSL1 损失。
+    """
+    mask = (next_token_type == 1)
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+
+    pos_embs = pos_embs[mask]  # [M, D]
+    log_feats = log_feats[mask]  # [M, D]
+    M = pos_embs.size(0)
+    device = pos_embs.device
+
+    if M <= 1:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+
+    # 正样本分数: s_pos = cos(u_i, v_i) / τ
+    s_pos = (log_feats * pos_embs).sum(dim=-1) / temperature  # (M,)
+
+    # 负样本索引（批内其它样本的正样本）
+    N = min(int(num_negatives), M - 1)
+    row = torch.arange(M, device=device).unsqueeze(1)  # (M,1)
+
+    if N == M - 1:
+        # 使用全量其它样本作为负样本
+        base = torch.arange(M - 1, device=device).unsqueeze(0).expand(M, -1)  # (M, M-1)
+        neg_idx = base + (base >= row)  # (M, M-1)，跳过对角（自身）
+    else:
+        # 随机采样 N 个负样本（可重复）
+        base = torch.randint(0, M - 1, (M, N), device=device)                 # (M, N) in [0, M-2]
+        neg_idx = base + (base >= row)                                        # 映射到 [0, M-1] 去掉自身
+
+    # 负样本分数
+    neg_embs = pos_embs[neg_idx]                                # (M, N, D)
+    s_neg = (log_feats.unsqueeze(1) * neg_embs).sum(dim=-1)      # (M, N)
+    s_neg = s_neg / temperature                          # (M, N)
+
+    # 成对差分
+    d = s_neg - s_pos.unsqueeze(1)  # (M, N)
+
+    # PSL1 激活 σ(d) = log(relu(d) + 1)，加上数值下限避免 -inf
+    s = torch.log(torch.relu(d) + 1.0) # (B, N)
+
+    # 聚合（tau_star 取 1.0）
+    loss_per_sample = torch.logsumexp(s, dim=1)  # (B,)
+    loss = loss_per_sample.mean()
+
+    return loss
 
 if __name__ == '__main__':
     # 路径与日志
@@ -203,8 +294,8 @@ if __name__ == '__main__':
     # 优化器与调度器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
     T_total = len(train_loader) * args.num_epochs
-    num_warmup_steps = int(T_total * 0.1)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=num_warmup_steps)
+    num_warmup_steps = int(T_total * 0.05)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=num_warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
 
@@ -233,7 +324,7 @@ if __name__ == '__main__':
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                     )
                     loss = InfoNCE(
-                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                        pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type, num_negatives=args.num_negatives
                     )
                 elif args.loss_type == 'batchsoftmax':
                     pos_embs, neg_embs, log_feats = model(
@@ -288,7 +379,8 @@ if __name__ == '__main__':
                             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
                         )
                         loss = InfoNCE(
-                            pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type
+                            pos_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                            num_negatives=args.num_negatives
                         )
                     elif args.loss_type == 'batchsoftmax':
                         pos_embs, neg_embs, log_feats = model(
