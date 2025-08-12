@@ -171,7 +171,6 @@ if __name__ == '__main__':
     # 模块初始化
     model.apply(init_weights)
     with torch.no_grad():
-        model.pos_emb.weight.data[0, :] = 0
         model.item_emb.weight.data[0, :] = 0
         model.user_emb.weight.data[0, :] = 0
         for k in model.sparse_emb:
@@ -209,7 +208,7 @@ if __name__ == '__main__':
 
             # 训练阶段（训练集）
             for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
                 device = args.device
                 seq = seq.to(device)
                 pos = pos.to(device)
@@ -218,7 +217,7 @@ if __name__ == '__main__':
                 next_token_type = next_token_type.to(device)
 
                 pos_embs, neg_embs, log_feats = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                 )
                 loss = InfoNCE(
                     pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
@@ -254,7 +253,7 @@ if __name__ == '__main__':
             valid_loss_sum = 0.0
             with torch.no_grad():
                 for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader)):
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
                     device = args.device
                     seq = seq.to(device)
                     pos = pos.to(device)
@@ -263,7 +262,7 @@ if __name__ == '__main__':
                     next_token_type = next_token_type.to(device)
 
                     pos_embs, neg_embs, log_feats = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                     )
                     loss = InfoNCE(
                         pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,

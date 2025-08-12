@@ -107,19 +107,25 @@ class MyDataset(torch.utils.data.Dataset):
             neg: 负样本ID
             token_type: 用户序列类型，1表示item，2表示user
             next_token_type: 下一个token类型，1表示item，2表示user
+            next_action_type: 下一个token动作类型，0表示曝光，1表示点击
             seq_feat: 用户序列特征，每个元素为字典，key为特征ID，value为特征值
             pos_feat: 正样本特征，每个元素为字典，key为特征ID，value为特征值
             neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
+            seq_ts: 序列时间戳，形状为 [maxlen + 1]，与 seq 对齐（padding 位置为 0）
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
+        # 每个元素都带上 timestamp
+        # 原始 user_sequence 元组示例： (u, i, user_feat, item_feat, action_type, timestamp)
 
         ext_user_sequence = []
-        for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, action_type, _ = record_tuple
+        for record_tuple in user_sequence:  # 例子：timestamp=1746225104
+            u, i, user_feat, item_feat, action_type, timestamp = record_tuple
             if u and user_feat:
-                ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
+                # user token: type=2
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, timestamp))
             if i and item_feat:
-                ext_user_sequence.append((i, item_feat, 1, action_type))
+                # item token: type=1
+                ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -128,6 +134,9 @@ class MyDataset(torch.utils.data.Dataset):
         next_token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_action_type = np.zeros([self.maxlen + 1], dtype=np.int32)
 
+        # 与 seq 对齐的时间戳；用 int64 以容纳 Unix 秒/毫秒
+        seq_ts = np.zeros([self.maxlen + 1], dtype=np.int64)
+
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
         neg_feat = np.empty([self.maxlen + 1], dtype=object)
@@ -135,39 +144,48 @@ class MyDataset(torch.utils.data.Dataset):
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
 
-        ts = set()
-        for record_tuple in ext_user_sequence:
-            if record_tuple[2] == 1 and record_tuple[0]:
-                ts.add(record_tuple[0])
+        # 已出现的 item id（用于采负）
+        item_ids_in_hist = set()
+        for rec in ext_user_sequence:
+            if rec[2] == 1 and rec[0]:
+                item_ids_in_hist.add(rec[0])
 
-        # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
+        # left-padding，从后往前填充到 maxlen+1
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_, act_type = record_tuple
-            next_i, next_feat, next_type, next_act_type = nxt
+            # 当前步
+            i, feat, type_, act_type, ts_cur = record_tuple
+            # 下一步（用于 pos/next_*）
+            next_i, next_feat, next_type, next_act_type, ts_next = nxt
+
             feat = self.fill_missing_feat(feat, i)
             next_feat = self.fill_missing_feat(next_feat, next_i)
+
             seq[idx] = i
             token_type[idx] = type_
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
             seq_feat[idx] = feat
+            seq_ts[idx] = int(ts_cur) if ts_cur is not None else 0  # 时间戳写入；缺失置 0
+
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
+                neg_id = self._random_neq(1, self.itemnum + 1, item_ids_in_hist)
                 neg[idx] = neg_id
                 neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+
             nxt = record_tuple
             idx -= 1
             if idx == -1:
                 break
 
+        # 缺省特征填充
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
         neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
 
     def __len__(self):
         """
@@ -269,29 +287,38 @@ class MyDataset(torch.utils.data.Dataset):
     def collate_fn(batch):
         """
         Args:
-            batch: 多个__getitem__返回的数据
+            batch: 多个 __getitem__ 返回的数据
 
         Returns:
-            seq: 用户序列ID, torch.Tensor形式
-            pos: 正样本ID, torch.Tensor形式
-            neg: 负样本ID, torch.Tensor形式
-            token_type: 用户序列类型, torch.Tensor形式
-            next_token_type: 下一个token类型, torch.Tensor形式
-            seq_feat: 用户序列特征, list形式
-            pos_feat: 正样本特征, list形式
-            neg_feat: 负样本特征, list形式
+            seq: 用户序列ID, torch.LongTensor [B, S]
+            pos: 正样本ID, torch.LongTensor [B, S]
+            neg: 负样本ID, torch.LongTensor [B, S]
+            token_type: 用户序列类型, torch.LongTensor [B, S]
+            next_token_type: 下一个token类型, torch.LongTensor [B, S]
+            next_action_type: 下一个token动作类型, torch.LongTensor [B, S]
+            seq_feat: 用户序列特征, list(长度 B, 每个元素为长度 S 的字典数组)
+            pos_feat: 正样本特征, list
+            neg_feat: 负样本特征, list
+            seq_ts: 与 seq 对齐的时间戳, torch.FloatTensor [B, S]
         """
-        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = zip(*batch)
-        seq = torch.from_numpy(np.array(seq))
-        pos = torch.from_numpy(np.array(pos))
-        neg = torch.from_numpy(np.array(neg))
-        token_type = torch.from_numpy(np.array(token_type))
-        next_token_type = torch.from_numpy(np.array(next_token_type))
-        next_action_type = torch.from_numpy(np.array(next_action_type))
+        # 注意：__getitem__ 现在返回了 seq_ts 作为最后一个元素
+        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = zip(*batch)
+
+        seq = torch.as_tensor(np.array(seq), dtype=torch.long)
+        pos = torch.as_tensor(np.array(pos), dtype=torch.long)
+        neg = torch.as_tensor(np.array(neg), dtype=torch.long)
+        token_type = torch.as_tensor(np.array(token_type), dtype=torch.long)
+        next_token_type = torch.as_tensor(np.array(next_token_type), dtype=torch.long)
+        next_action_type = torch.as_tensor(np.array(next_action_type), dtype=torch.long)
+
+        # 时间戳建议用 float32，便于后续做差、对数分桶等运算（若你希望保持整数，也可改成 torch.long）
+        seq_ts = torch.as_tensor(np.array(seq_ts), dtype=torch.float32)
+
         seq_feat = list(seq_feat)
         pos_feat = list(pos_feat)
         neg_feat = list(neg_feat)
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+
+        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
 
 
 class MyTestDataset(MyDataset):
@@ -332,62 +359,65 @@ class MyTestDataset(MyDataset):
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
 
         Args:
-            uid: 用户在self.data_file中储存的行号
+            uid: 用户在 self.data_file 中储存的行号
         Returns:
             seq: 用户序列ID
             token_type: 用户序列类型，1表示item，2表示user
             seq_feat: 用户序列特征，每个元素为字典，key为特征ID，value为特征值
-            user_id: user_id eg. user_xxxxxx ,便于后面对照答案
+            user_id: user_xxxxxx（便于对照答案）
+            seq_ts: 与 seq 对齐的时间戳（int64），padding 位置为 0
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
+        # 原始 record: (u, i, user_feat, item_feat, action_type, timestamp)
 
         ext_user_sequence = []
+        user_id = None
+
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, _ = record_tuple
+            u, i, user_feat, item_feat, _, timestamp = record_tuple
+
             if u:
-                if type(u) == str:  # 如果是字符串，说明是user_id
+                if isinstance(u, str):  # 字符串：user_id
                     user_id = u
-                else:  # 如果是int，说明是re_id
+                else:                   # re_id -> 原始 user_id
                     user_id = self.indexer_u_rev[u]
+
             if u and user_feat:
-                if type(u) == str:
-                    u = 0
-                if user_feat:
-                    user_feat = self._process_cold_start_feat(user_feat)
-                ext_user_sequence.insert(0, (u, user_feat, 2))
+                uid_val = 0 if isinstance(u, str) else u
+                user_feat = self._process_cold_start_feat(user_feat) if user_feat else user_feat
+                # 在队首插入 user token，并携带时间戳
+                ext_user_sequence.insert(0, (uid_val, user_feat, 2, timestamp))
 
             if i and item_feat:
-                # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
+                # 序列中预测未见过的 item：creative_id 很大 -> 置 0
                 if i > self.itemnum:
                     i = 0
-                if item_feat:
-                    item_feat = self._process_cold_start_feat(item_feat)
-                ext_user_sequence.append((i, item_feat, 1))
+                item_feat = self._process_cold_start_feat(item_feat) if item_feat else item_feat
+                ext_user_sequence.append((i, item_feat, 1, timestamp))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
+        # 与 seq 对齐的时间戳（Unix 秒/分/小时，视你的原始单位而定）
+        seq_ts = np.zeros([self.maxlen + 1], dtype=np.int64)
 
         idx = self.maxlen
 
-        ts = set()
-        for record_tuple in ext_user_sequence:
-            if record_tuple[2] == 1 and record_tuple[0]:
-                ts.add(record_tuple[0])
-
+        # 从后向前填充到固定长度；与训练一致，丢弃最后一个元素作为“下一步”
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_ = record_tuple
+            i, feat, type_, ts_cur = record_tuple
             feat = self.fill_missing_feat(feat, i)
             seq[idx] = i
             token_type[idx] = type_
             seq_feat[idx] = feat
+            seq_ts[idx] = int(ts_cur) if ts_cur is not None else 0
             idx -= 1
             if idx == -1:
                 break
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
 
-        return seq, token_type, seq_feat, user_id
+        return seq, token_type, seq_feat, user_id, seq_ts
 
     def __len__(self):
         """
@@ -401,23 +431,23 @@ class MyTestDataset(MyDataset):
     @staticmethod
     def collate_fn(batch):
         """
-        将多个__getitem__返回的数据拼接成一个batch
-
-        Args:
-            batch: 多个__getitem__返回的数据
+        将多个 __getitem__ 返回的数据拼接成一个 batch
 
         Returns:
-            seq: 用户序列ID, torch.Tensor形式
-            token_type: 用户序列类型, torch.Tensor形式
-            seq_feat: 用户序列特征, list形式
-            user_id: user_id, str
+            seq: torch.LongTensor [B, S]
+            token_type: torch.LongTensor [B, S]
+            seq_feat: list，长度 B，每个元素是长度 S 的字典数组
+            user_id: tuple(str)，长度 B
+            seq_ts: torch.FloatTensor [B, S]（便于后续做差/分桶）
         """
-        seq, token_type, seq_feat, user_id = zip(*batch)
-        seq = torch.from_numpy(np.array(seq))
-        token_type = torch.from_numpy(np.array(token_type))
+        seq, token_type, seq_feat, user_id, seq_ts = zip(*batch)
+        seq = torch.from_numpy(np.array(seq)).long()
+        token_type = torch.from_numpy(np.array(token_type)).long()
         seq_feat = list(seq_feat)
+        # 用 float32 方便后续构造时间偏置（如 log/对数分桶）
+        seq_ts = torch.from_numpy(np.array(seq_ts)).float()
 
-        return seq, token_type, seq_feat, user_id
+        return seq, token_type, seq_feat, user_id, seq_ts
 
 
 def save_emb(emb, save_path):

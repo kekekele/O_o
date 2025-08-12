@@ -1,11 +1,94 @@
 from pathlib import Path
-
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from dataset import save_emb
+
+# -------- 相对时间分桶与偏置模块 --------
+
+def make_time_bucketizer(
+    num_buckets: int,
+    max_exact: int = 24,           # 一天内线性（单位=小时时就是 24 小时）
+    unit_seconds: float = 3600.0,  # 把“秒”换算到“小时”（若用分钟则设 60.0）
+):
+    """
+    将非负时间差分桶：
+      - 线性段: x < max_exact -> floor(x)
+      - 对数段: x >= max_exact，每放大 base 倍桶号 +1
+    约定:
+      - 正常桶号范围 [0, num_buckets-1]
+      - 溢出桶号为 num_buckets（调用方有 ts_w.shape[0] = num_buckets + 1）
+    要求:
+      - num_buckets > max_exact，否则没有对数段可用
+    """
+    assert num_buckets > max_exact >= 1, "num_buckets 必须大于 max_exact"
+    log_buckets = num_buckets - max_exact
+    log_base = 0.301 # follow HSTU
+
+    def bucketize(x_seconds: torch.Tensor) -> torch.Tensor:
+        # 1) 换算到目标单位（如小时/分钟），并裁剪到非负
+        x = (x_seconds / unit_seconds).clamp(min=0)
+        # 2) 线性段
+        small = x < max_exact
+        lin = x.floor().long().clamp_max(max_exact - 1)  # [0 .. max_exact-1]
+        # 3) 对数段（按倍增）
+        #    x in [max_exact * base^k, max_exact * base^(k+1)) -> bucket = max_exact + k
+        #    注意：对 small 位置用 max_exact 仅为避免 log(0)，不会被最终选择
+        z = torch.where(small, torch.as_tensor(float(max_exact), device=x.device, dtype=x.dtype), x)
+        k = torch.floor(torch.log(z / max_exact) / log_base).long()  # k >= 0
+        k = k.clamp_min(0).clamp_max(log_buckets - 1)               # 限到可用对数桶数
+        log_idx = max_exact + k                                      # [max_exact .. num_buckets-1]
+        # 4) 合并线性/对数段
+        idx = torch.where(small, lin, log_idx)
+        # 5) 非有限值 -> 溢出桶
+        idx = torch.where(torch.isfinite(x), idx, torch.full_like(idx, num_buckets))
+        # 6) 最终裁剪到 [0 .. num_buckets]（含溢出桶）
+        return idx.clamp_(0, num_buckets)
+
+    return bucketize
+
+
+class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
+    """
+    生成两类 bias（logits）：
+      - rel_pos_bias: [1, S, S]，仅由相对位置决定
+      - rel_ts_bias:  [B, S, S]，由 t_{i+1} - t_j 的“时间桶”决定
+    """
+    def __init__(self, max_seq_len: int, num_buckets: int, bucketization_fn):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.num_buckets = num_buckets
+        self.bucketization_fn = bucketization_fn
+        # 可学习参数
+        self.ts_w = torch.nn.Parameter(torch.empty(num_buckets + 1).normal_(mean=0.0, std=0.02))
+        self.pos_w = torch.nn.Parameter(torch.empty(2 * max_seq_len - 1).normal_(mean=0.0, std=0.02))
+
+    def forward(self, timestamps: torch.Tensor):
+        """
+        timestamps: [B, S]（单位例如秒；浮点/整型均可）
+        返回：
+          rel_pos_bias: [1, S, S]
+          rel_ts_bias:  [B, S, S]
+        """
+        B, S = timestamps.shape
+
+        # 相对位置偏置（Toeplitz），支持 S <= max_seq_len
+        pos_vec = self.pos_w[: 2 * S - 1]  # 中心在 S-1
+        t = F.pad(pos_vec, [0, S]).repeat(S)
+        t = t[..., :-S].reshape(1, S, 3 * S - 2)
+        r = (2 * S - 1) // 2
+        rel_pos_bias = t[:, :, r:-r]  # [1, S, S]
+        rel_pos_bias = rel_pos_bias.expand(B, -1, -1) # 广播到[B, S, S]
+
+        # 相对时间分桶（t_{i+1} - t_j）
+        ext = torch.cat([timestamps, timestamps[:, S - 1:S]], dim=1)  # [B, S+1]
+        deltas = ext[:, 1:].unsqueeze(2) - ext[:, :-1].unsqueeze(1)   # [B, S, S]
+        bucket_ids = torch.clamp(self.bucketization_fn(deltas), 0, self.num_buckets).detach()
+        rel_ts_bias = torch.index_select(self.ts_w, 0, bucket_ids.view(-1)).view(B, S, S)  # [B, S, S]
+        return rel_pos_bias, rel_ts_bias
 
 
 class FlashMultiHeadAttention(torch.nn.Module):
@@ -22,9 +105,9 @@ class FlashMultiHeadAttention(torch.nn.Module):
         self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.out_linear = torch.nn.Linear(3 * hidden_units, hidden_units)
 
-    def forward(self, query, key, value, attn_mask=None):
+    def forward(self, query, key, value, attn_mask=None, rel_pos_bias=None, rel_ts_bias=None):
         batch_size, seq_len, _ = query.size()
 
         # 计算Q, K, V
@@ -41,7 +124,7 @@ class FlashMultiHeadAttention(torch.nn.Module):
             # PyTorch 2.0+ 使用内置的Flash Attention
             attn_output = F.scaled_dot_product_attention(
                 Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
-            )
+            ) # [B,H,S,D]
         else:
             # 降级到标准注意力机制
             scale = (self.head_dim) ** -0.5
@@ -54,11 +137,23 @@ class FlashMultiHeadAttention(torch.nn.Module):
             attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
             attn_output = torch.matmul(attn_weights, V)
 
-        # reshape回原来的格式
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
+        multi_ctx = [attn_output]
+        if rel_pos_bias is not None:
+            rel_pos_bias = rel_pos_bias * attn_mask
+            pos_ctx = torch.matmul(rel_pos_bias.unsqueeze(1), V)  # [B,1,S,S] @ [B,H,S,D] -> [B,H,S,D]
+            multi_ctx.append(pos_ctx)
 
-        # 最终的线性变换
-        output = self.out_linear(attn_output)
+        if rel_ts_bias is not None:
+            rel_ts_bias = rel_ts_bias * attn_mask
+            ts_ctx = torch.matmul(rel_ts_bias.unsqueeze(1), V)  # [B,1,S,S] @ [B,H,S,D] -> [B,H,S,D]            multi_ctx.append(pos_ctx)
+            multi_ctx.append(ts_ctx)
+
+        multi_ctx = torch.cat(multi_ctx, dim=-1)  # [B,H,S,3D]
+
+        # reshape回原来的格式
+        multi_ctx = multi_ctx.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units * 3)
+
+        output = self.out_linear(multi_ctx)
 
         return output, None
 
@@ -144,7 +239,6 @@ class BaselineModel(torch.nn.Module):
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.embedding_dim, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
@@ -198,6 +292,20 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.embedding_dim, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.embedding_dim)
+
+        # -------- 相对 bias（位置 + 时间）--------
+        self.ts_num_buckets = getattr(args, "ts_num_buckets", 128)
+        self.ts_max_exact = getattr(args, "ts_bucket_max_exact", 16)
+
+        self.time_bucketizer = make_time_bucketizer(
+            num_buckets=self.ts_num_buckets,
+            max_exact=self.ts_max_exact,
+        )
+        self.rel_bias = SeparatedRelativeTimeAndPositionBias(
+            max_seq_len=self.maxlen + 1,
+            num_buckets=self.ts_num_buckets,
+            bucketization_fn=self.time_bucketizer,
+        )
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -342,7 +450,20 @@ class BaselineModel(torch.nn.Module):
         seqs_emb = F.normalize(seqs_emb, dim=-1)
         return seqs_emb
 
-    def log2feats(self, log_seqs, mask, seq_feature):
+    def _make_rel_bias(self, seq_ts: torch.Tensor):
+        """
+        计算相对 bias（logits）
+        返回：
+          rel_pos_bias: [1,S,S]
+          rel_ts_bias:  [B,S,S]
+        """
+        ts = seq_ts.to(self.dev)
+        if ts.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            ts = ts.float()
+        rel_pos_bias, rel_ts_bias = self.rel_bias(ts)
+        return rel_pos_bias.to(ts.dtype), rel_ts_bias.to(ts.dtype)
+
+    def log2feats(self, log_seqs, mask, seq_feature, seq_ts):
         """
         Args:
             log_seqs: 序列ID
@@ -352,13 +473,8 @@ class BaselineModel(torch.nn.Module):
         Returns:
             seqs_emb: 序列的Embedding，形状为 [batch_size, maxlen, hidden_units]
         """
-        batch_size = log_seqs.shape[0]
-        maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.user_emb.embedding_dim**0.5
-        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= log_seqs != 0
-        seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
@@ -367,14 +483,16 @@ class BaselineModel(torch.nn.Module):
         attention_mask_pad = (mask != 0).to(self.dev)
         attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
 
+        rel_pos_bias, rel_ts_bias = self._make_rel_bias(seq_ts)
+
         for i in range(len(self.attention_layers)):
             if self.norm_first:
                 x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
+                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias)
                 seqs = seqs + mha_outputs
                 seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
+                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias)
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
@@ -383,7 +501,7 @@ class BaselineModel(torch.nn.Module):
         return log_feats
 
     def forward(
-        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
+        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature, seq_ts
     ):
         """
         训练时调用，计算正负样本的logits
@@ -403,15 +521,14 @@ class BaselineModel(torch.nn.Module):
             pos_logits: 正样本logits，形状为 [batch_size, maxlen]
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
-        log_feats = self.log2feats(user_item, mask, seq_feature)
-        loss_mask = (next_mask == 1).to(self.dev)
+        log_feats = self.log2feats(user_item, mask, seq_feature, seq_ts)
 
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
         return pos_embs, neg_embs, log_feats
 
-    def predict(self, log_seqs, seq_feature, mask):
+    def predict(self, log_seqs, seq_feature, mask, seq_ts):
         """
         计算用户序列的表征
         Args:
@@ -421,7 +538,7 @@ class BaselineModel(torch.nn.Module):
         Returns:
             final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
         """
-        log_feats = self.log2feats(log_seqs, mask, seq_feature)
+        log_feats = self.log2feats(log_seqs, mask, seq_feature, seq_ts)
 
         final_feat = log_feats[:, -1, :]
 
