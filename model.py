@@ -7,8 +7,6 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
-# -------- 相对时间分桶与偏置模块 --------
-
 def make_time_bucketizer(
     num_buckets: int,
     max_exact: int = 24,           # 一天内线性（单位=小时时就是 24 小时）
@@ -99,6 +97,7 @@ class FlashMultiHeadAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
+        self.scale = self.head_dim ** -0.5
 
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
 
@@ -123,12 +122,12 @@ class FlashMultiHeadAttention(torch.nn.Module):
         if hasattr(F, 'scaled_dot_product_attention'):
             # PyTorch 2.0+ 使用内置的Flash Attention
             attn_output = F.scaled_dot_product_attention(
-                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
+                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1), scale=self.scale
             ) # [B,H,S,D]
         else:
             # 降级到标准注意力机制
-            scale = (self.head_dim) ** -0.5
-            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
             if attn_mask is not None:
                 scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))

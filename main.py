@@ -28,10 +28,10 @@ def get_args():
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
-    parser.add_argument('--hidden_units', default=512, type=int)
+    parser.add_argument('--hidden_units', default=384, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=8, type=int)
+    parser.add_argument('--num_heads', default=6, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
