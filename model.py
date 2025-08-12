@@ -295,11 +295,9 @@ class BaselineModel(torch.nn.Module):
 
         # -------- 相对 bias（位置 + 时间）--------
         self.ts_num_buckets = getattr(args, "ts_num_buckets", 128)
-        self.ts_max_exact = getattr(args, "ts_bucket_max_exact", 16)
 
         self.time_bucketizer = make_time_bucketizer(
             num_buckets=self.ts_num_buckets,
-            max_exact=self.ts_max_exact,
         )
         self.rel_bias = SeparatedRelativeTimeAndPositionBias(
             max_seq_len=self.maxlen + 1,

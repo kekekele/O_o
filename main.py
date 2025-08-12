@@ -37,6 +37,7 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', default=False, action='store_true')
+    parser.add_argument('--ts_num_buckets', default=128, type=int)
 
     parser.add_argument('--temperature', default=0.07, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
