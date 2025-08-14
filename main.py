@@ -28,10 +28,10 @@ def get_args():
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
-    parser.add_argument('--hidden_units', default=320, type=int)
+    parser.add_argument('--hidden_units', default=512, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=5, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument('--norm_first', default=False, action='store_true')
     parser.add_argument('--ts_num_buckets', default=128, type=int)
 
-    parser.add_argument('--temperature', default=0.07, type=float)
+    parser.add_argument('--temperature', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
 
     # MMemb Feature ID
@@ -124,6 +124,72 @@ def InfoNCE(
     loss = F.cross_entropy(logits, labels, reduction='mean')
     return loss
 
+@torch.no_grad()
+def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=0.05):
+    """
+    在验证子集上计算 score = 0.31*HR@10 + 0.69*NDCG@10
+    使用近似候选集：对每个查询，候选集=该样本的正样本 + 本批所有负样本池（与 InfoNCE 一致）。
+    """
+    model.eval()
+    total_hits = 0.0
+    total_dcg = 0.0
+    total_queries = 0
+
+    for batch in valid_subset_loader:
+        # 解包
+        (seq, pos, neg, token_type, next_token_type, next_action_type,
+         seq_feat, pos_feat, neg_feat, seq_ts) = batch
+
+        seq = seq.to(device)
+        pos = pos.to(device)
+        neg = neg.to(device)
+        token_type = token_type.to(device)
+        next_token_type = next_token_type.to(device)
+
+        # 前向
+        pos_embs, neg_embs, log_feats = model(
+            seq, pos, neg, token_type, next_token_type, next_action_type,
+            seq_feat, pos_feat, neg_feat, seq_ts
+        )  # [B,L,D] x3
+
+        # 只评 item 位置
+        mask = (next_token_type == 1)
+        if mask.sum().item() == 0:
+            continue
+
+        Q = log_feats[mask]   # [M,D]
+        P = pos_embs[mask]    # [M,D]
+        N = neg_embs[mask]    # [M,D] 批内负样本池
+
+        # 构造 logits（与 InfoNCE 一致的打分方式，不加温度缩放也可以）
+        pos_logits = (Q * P).sum(dim=-1, keepdim=True)  # [M,1]
+        neg_logits = Q @ N.t()                          # [M,M]
+        logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+M]
+
+        # Top-k 命中与 NDCG
+        k = min(10, logits.size(1))
+        topk = torch.topk(logits, k=k, dim=1)
+        hits_bool = (topk.indices == 0)                 # [M,k] 是否包含正样本
+        hits_any = hits_bool.any(dim=1)                 # [M]
+        total_hits += hits_any.float().sum().item()
+
+        # 正样本在 top-k 的位置 -> NDCG
+        # 若未命中 top-k，贡献为 0；若命中，位置 p 的 DCG=1/log2(p+2)
+        # 使用 argmax 找到第一个 True 的位置（未命中时值无效，但会被 hits_any 掩蔽）
+        first_pos = torch.argmax(hits_bool.int(), dim=1)               # [M]
+        dcg = hits_any.float() * (1.0 / torch.log2(first_pos.float() + 2.0))
+        total_dcg += dcg.sum().item()
+
+        total_queries += logits.size(0)
+
+    if total_queries == 0:
+        return 0.0
+
+    hr10 = total_hits / total_queries
+    ndcg10 = total_dcg / total_queries
+    score = 0.31 * hr10 + 0.69 * ndcg10
+    return score
+
 if __name__ == '__main__':
     # 路径与日志
     Path(os.environ.get('TRAIN_LOG_PATH')).mkdir(parents=True, exist_ok=True)
@@ -157,6 +223,21 @@ if __name__ == '__main__':
     )
     valid_loader = DataLoader(
         valid_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
+        collate_fn=dataset.collate_fn,
+    )
+    # 验证子集：随机采样 5% 用户
+    n_valid_total = len(valid_dataset)
+    n_valid_sub = max(1, int(n_valid_total * 0.05))
+    g_sub = torch.Generator().manual_seed(args.seed)  # 固定种子，保证可复现
+    perm = torch.randperm(n_valid_total, generator=g_sub)
+    valid_subset_idx = perm[:n_valid_sub].tolist()
+    valid_subset = torch.utils.data.Subset(valid_dataset, valid_subset_idx)
+    valid_subset_loader = DataLoader(
+        valid_subset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -248,6 +329,25 @@ if __name__ == '__main__':
                 optimizer.step()
 
                 global_step += 1
+
+                # 每 5000 步在 5% 验证子集上评估 score
+                if global_step % 5000 == 0:
+                    prev_mode = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        score = evaluate_valid_subset_score(
+                            model, valid_subset_loader, device=args.device, temperature=args.temperature
+                        )
+                    # 恢复训练/评估模式
+                    if prev_mode:
+                        model.train()
+                    writer.add_scalar('Score/valid_subset', score, global_step)
+                    log_json = json.dumps(
+                        {'global_step': global_step, 'valid_subset_score': float(score), 'time': time.time()}
+                    )
+                    print(log_json)
+                    log_file.write(log_json + '\n')
+                    log_file.flush()
 
             # 验证阶段（评估）
             model.eval()
