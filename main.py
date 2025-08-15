@@ -37,7 +37,6 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', default=False, action='store_true')
-    parser.add_argument('--ts_num_buckets', default=128, type=int)
 
     parser.add_argument('--temperature', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
@@ -304,14 +303,6 @@ if __name__ == '__main__':
                 loss = InfoNCE(
                     pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
                 )
-                bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                mask = (next_token_type == 1)
-                pos_logits = (log_feats * pos_embs).sum(dim=-1)
-                neg_logits = (log_feats * neg_embs).sum(dim=-1)
-                pos_labels = torch.ones_like(pos_logits, device=device)
-                neg_labels = torch.zeros_like(neg_logits, device=device)
-                loss += bce_criterion(pos_logits[mask], pos_labels[mask])
-                loss += bce_criterion(neg_logits[mask], neg_labels[mask])
 
                 log_json = json.dumps(
                     {'global_step': global_step, 'loss': float(loss.item()), 'epoch': epoch,
@@ -368,14 +359,6 @@ if __name__ == '__main__':
                     loss = InfoNCE(
                         pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
                     )
-                    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-                    mask = (next_token_type == 1)
-                    pos_logits = (log_feats * pos_embs).sum(dim=-1)
-                    neg_logits = (log_feats * neg_embs).sum(dim=-1)
-                    pos_labels = torch.ones_like(pos_logits, device=device)
-                    neg_labels = torch.zeros_like(neg_logits, device=device)
-                    loss += bce_criterion(pos_logits[mask], pos_labels[mask])
-                    loss += bce_criterion(neg_logits[mask], neg_labels[mask])
 
                     valid_loss_sum += loss.item()
 
@@ -387,73 +370,6 @@ if __name__ == '__main__':
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
 
-        # # ===== 额外步骤：用验证集训练一轮（fine-tune）=====
-        # # 可复现的乱序 DataLoader（验证集）
-        # valid_train_loader = DataLoader(
-        #     valid_dataset,
-        #     batch_size=args.batch_size,
-        #     shuffle=True,  # 训练用 shuffle
-        #     num_workers=num_workers,
-        #     worker_init_fn=worker_init_fn if num_workers > 0 else None,
-        #     collate_fn=dataset.collate_fn,
-        #     generator=torch.Generator().manual_seed(args.seed + 1),  # 可复现
-        # )
-        #
-        # model.train()
-        # finetune_step = 0
-        #
-        # # 如需单独的微调学习率（例如降低10倍），可解除注释：
-        # # for pg in optimizer.param_groups:
-        # #     pg['lr'] = 1e-5
-        #
-        # print("Start fine-tuning on validation set for 1 epoch")
-        # for step, batch in tqdm(enumerate(valid_train_loader), total=len(valid_train_loader)):
-        #     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
-        #     device = args.device
-        #     seq = seq.to(device)
-        #     pos = pos.to(device)
-        #     neg = neg.to(device)
-        #     token_type = token_type.to(device)
-        #     next_token_type = next_token_type.to(device)
-        #
-        #     pos_logits, neg_logits = model(
-        #         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-        #     )
-        #
-        #     if args.loss_type == 'listwise':
-        #         loss = listwise_loss_from_logits(
-        #             pos_logits, neg_logits, next_token_type, temperature=args.temperature
-        #         )
-        #     else:
-        #         bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-        #         mask = (next_token_type == 1)
-        #         pos_labels = torch.ones_like(pos_logits, device=device)
-        #         neg_labels = torch.zeros_like(neg_logits, device=device)
-        #         loss = bce_criterion(pos_logits[mask], pos_labels[mask])
-        #         loss += bce_criterion(neg_logits[mask], neg_labels[mask])
-        #
-        #     log_json = json.dumps(
-        #         {'global_step': global_step, 'fine_tune_step': finetune_step, 'loss': float(loss.item()),
-        #          'phase': 'finetune_valid', 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
-        #     )
-        #     print(log_json)
-        #     log_file.write(log_json + '\n')
-        #     log_file.flush()
-        #     writer.add_scalar('Loss/finetune_valid', loss.item(), global_step)
-        #
-        #     optimizer.zero_grad(set_to_none=True)
-        #     loss.backward()
-        #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        #     optimizer.step()
-        #
-        #     finetune_step += 1
-        #     global_step += 1
-
-        # 保存最终模型（fine-tune 后）
-        # final_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"final_after_finetune_step{global_step}")
-        # final_dir.mkdir(parents=True, exist_ok=True)
-        # torch.save(model.state_dict(), final_dir / "final_model.pt")
-        # print(f"Fine-tuning done. Final model saved to: {final_dir}")
 
     print("Done")
     writer.close()
