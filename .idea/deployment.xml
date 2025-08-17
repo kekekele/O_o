@@ -86,6 +86,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="西北B区 / 227机">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="西北B区 / 267机">
         <serverdata>
           <mappings>

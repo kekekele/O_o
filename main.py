@@ -16,6 +16,11 @@ from tqdm import tqdm
 from dataset import MyDataset
 from model import BaselineModel
 
+# 可根据需要修改，或在外部设置
+os.environ.setdefault("TRAIN_LOG_PATH", "./logs")
+os.environ.setdefault("TRAIN_TF_EVENTS_PATH", "./logs/tf_events")
+os.environ.setdefault("TRAIN_DATA_PATH", "./data/TencentGR_1k")
+os.environ.setdefault("TRAIN_CKPT_PATH", "./result")
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -28,10 +33,10 @@ def get_args():
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=64, type=int)
-    parser.add_argument('--hidden_units', default=512, type=int)
+    parser.add_argument('--hidden_units', default=256, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=8, type=int)
+    parser.add_argument('--num_heads', default=4, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
@@ -79,49 +84,72 @@ def init_weights(m: torch.nn.Module):
         if hasattr(m, 'bias') and m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
+
 def InfoNCE(
     pos_embs: torch.Tensor,           # [B, L, D]
     neg_embs: torch.Tensor,           # [B, L, D]
     log_feats: torch.Tensor,          # [B, L, D]
     temperature: float,               # > 0
     next_token_type: torch.Tensor,    # [B, L]，1 表示 item
-) -> torch.Tensor:
+    next_action_type: torch.Tensor,   # [B, L]，下一个token动作类型，0表示曝光，1表示点击
+    click_scale: float = 2.0,  # 点击样本损失权重
+    exp_scale: float = 0.5,  # 曝光样本损失权重
+):
     """
-    Batch-all negatives InfoNCE:
-    对每个 query 使用本批次 mask 后的全部负样本作为负例（不降采样）。
-
-    返回：
-        平均交叉熵损失（标注：正样本为第 0 列）
+    Batch-all negatives InfoNCE（余弦相似度，负样本分母+1，负样本朝 -1 优化）
+    - 点击/曝光通过“损失外权重”实现，不再改动正样本 logit 的几何关系
+    返回：loss, stats
     """
     assert temperature > 0.0, "temperature must be > 0"
 
+    # 仅对 item 位置计算
     mask = (next_token_type == 1)
     if mask.dtype is not torch.bool:
         mask = mask.bool()
 
-    # 展平后按 mask 取出有效位置
-    Q   = log_feats[mask]   # [M, D]
-    Kp  = pos_embs[mask]    # [M, D] 每行对应自己的正样本 key
-    Kneg = neg_embs[mask]   # [M, D] 本批全部负样本池（供所有行共享）
-    device = Q.device
+    Qn    = log_feats[mask]          # [M, D]
+    Kpn   = pos_embs[mask]           # [M, D]
+    Knegn = neg_embs[mask]           # [M, D] 共享负样本池
+    act   = next_action_type[mask]   # [M]
 
-    M = Q.size(0)
+    device = Qn.device
+    M = Qn.size(0)
     if M == 0:
-        return torch.zeros((), device=device)
+        return torch.zeros((), device=device), {
+            'mean_pos_sim': 0.0, 'mean_neg_sim': 0.0, 'click_ratio': 0.0
+        }
 
-    # 正样本打分：[M, 1]
-    pos_logits = (Q * Kp).sum(dim=-1, keepdim=True) / temperature
+    # 正样本相似度与 logit（不做动作缩放）
+    # 若需要归一化向量获得真正余弦，请确保上游已做 normalize 或在此加 F.normalize
+    pos_sim    = (Qn * Kpn).sum(dim=-1, keepdim=True)           # [M,1] ∈[-1,1]
+    pos_logits = pos_sim / temperature                          # [M,1]
 
-    # 全批负样本打分：[M, M]
-    # 每个 query 与整批负样本池逐一打分
-    neg_logits = (Q @ Kneg.t()) / temperature
+    # 负样本相似度与“分母+1”的变换（保持你的原设计）
+    neg_sim    = Qn @ Knegn.t()                                 # [M,M] ∈[-1,1]
+    neg_logits = neg_sim / temperature   # [M,M]
 
-    # 拼接：[M, 1 + M]，labels 全为 0（正样本在第 0 列）
-    logits = torch.cat([pos_logits, neg_logits], dim=1)
+    # 拼接 logits
+    logits = torch.cat([pos_logits, neg_logits], dim=1)         # [M, 1+M]
     labels = torch.zeros(M, dtype=torch.long, device=device)
 
-    loss = F.cross_entropy(logits, labels, reduction='mean')
-    return loss
+    # 样本级别权重：点击=click_scale，曝光=exp_scale
+    act_f = act.to(Qn.dtype)
+    sample_weight = torch.where(
+        act_f > 0.5,
+        torch.full_like(act_f, click_scale),
+        torch.full_like(act_f, exp_scale)
+    )  # [M]
+
+    # 逐样本 CE，再按权重归一化
+    per_example_loss = F.cross_entropy(logits, labels, reduction='none')  # [M]
+    loss = (per_example_loss * sample_weight).mean()
+
+    stats = {
+        'mean_pos_sim': float(pos_sim.mean().item()),
+        'mean_neg_sim': float(neg_sim.mean().item()),
+    }
+
+    return loss, stats
 
 @torch.no_grad()
 def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=0.05):
@@ -211,7 +239,7 @@ if __name__ == '__main__':
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [n_train, n_valid], generator=split_gen)
 
     # DataLoader
-    num_workers = 0
+    num_workers = 4
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -219,6 +247,8 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -227,6 +257,8 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
     )
     # 验证子集：随机采样 5% 用户
     n_valid_total = len(valid_dataset)
@@ -242,6 +274,8 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
     )
 
     # 模型
@@ -296,12 +330,14 @@ if __name__ == '__main__':
                 neg = neg.to(device)
                 token_type = token_type.to(device)
                 next_token_type = next_token_type.to(device)
+                next_action_type = next_action_type.to(device)
 
                 pos_embs, neg_embs, log_feats = model(
                     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                 )
-                loss = InfoNCE(
+                loss, stats = InfoNCE(
                     pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                    next_action_type=next_action_type
                 )
 
                 log_json = json.dumps(
@@ -312,6 +348,8 @@ if __name__ == '__main__':
                 log_file.write(log_json + '\n')
                 log_file.flush()
                 writer.add_scalar('Loss/train', loss.item(), global_step)
+                writer.add_scalar('Diag/mean_pos_sim', stats['mean_pos_sim'], global_step)
+                writer.add_scalar('Diag/mean_neg_sim', stats['mean_neg_sim'], global_step)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -352,12 +390,14 @@ if __name__ == '__main__':
                     neg = neg.to(device)
                     token_type = token_type.to(device)
                     next_token_type = next_token_type.to(device)
+                    next_action_type = next_action_type.to(device)
 
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                     )
-                    loss = InfoNCE(
+                    loss, _ = InfoNCE(
                         pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                        next_action_type=next_action_type
                     )
 
                     valid_loss_sum += loss.item()

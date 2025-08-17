@@ -200,8 +200,6 @@ class BaselineModel(torch.nn.Module):
         self.forward_layers = torch.nn.ModuleList()
 
         self._init_feat_info(feat_statistics, feat_types)
-        self.init_pos_bias = torch.nn.Parameter(torch.zeros(args.num_blocks))
-        self.init_ts_bias = torch.nn.Parameter(torch.zeros(args.num_blocks))
 
         userdim = args.embedding_dim * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
@@ -374,6 +372,7 @@ class BaselineModel(torch.nn.Module):
             # batch-convert and transfer to GPU
             tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
             item_feat_list.append(self.emb_transform[k](tensor_feature))
+
 
         # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)

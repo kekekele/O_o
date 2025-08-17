@@ -56,11 +56,20 @@ class MyDataset(torch.utils.data.Dataset):
 
     def _load_data_and_offsets(self):
         """
-        加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
+        加载用户序列偏移量；不在此处打开文件，避免在多进程间传递已打开句柄
         """
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
+        # 仅记录路径，句柄延迟到 __getitem__ 再在各 worker 内部打开
+        self._data_file_path = self.data_dir / "seq.jsonl"
+        self.data_file = None  # 懒打开
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+    def _ensure_file_open(self):
+        """
+        在各 worker 进程内懒加载打开数据文件
+        """
+        if getattr(self, "data_file", None) is None:
+            self.data_file = open(self._data_file_path, 'rb')
 
     def _load_user_data(self, uid):
         """
@@ -80,14 +89,6 @@ class MyDataset(torch.utils.data.Dataset):
     def _random_neq(self, l, r, s):
         """
         生成一个不在序列s中的随机整数, 用于训练时的负采样
-
-        Args:
-            l: 随机整数的最小值
-            r: 随机整数的最大值
-            s: 序列
-
-        Returns:
-            t: 不在序列s中的随机整数
         """
         t = np.random.randint(l, r)
         while t in s or str(t) not in self.item_feat_dict:
@@ -97,22 +98,10 @@ class MyDataset(torch.utils.data.Dataset):
     def __getitem__(self, uid):
         """
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
-
-        Args:
-            uid: 用户ID(reid)
-
-        Returns:
-            seq: 用户序列ID
-            pos: 正样本ID（即下一个真实访问的item）
-            neg: 负样本ID
-            token_type: 用户序列类型，1表示item，2表示user
-            next_token_type: 下一个token类型，1表示item，2表示user
-            next_action_type: 下一个token动作类型，0表示曝光，1表示点击
-            seq_feat: 用户序列特征，每个元素为字典，key为特征ID，value为特征值
-            pos_feat: 正样本特征，每个元素为字典，key为特征ID，value为特征值
-            neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
-            seq_ts: 序列时间戳，形状为 [maxlen + 1]，与 seq 对齐（padding 位置为 0）
         """
+        # 关键：在 worker 内懒打开文件，支持 num_workers>0
+        self._ensure_file_open()
+
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
         # 每个元素都带上 timestamp
         # 原始 user_sequence 元组示例： (u, i, user_feat, item_feat, action_type, timestamp)
@@ -190,19 +179,12 @@ class MyDataset(torch.utils.data.Dataset):
     def __len__(self):
         """
         返回数据集长度，即用户数量
-
-        Returns:
-            usernum: 用户数量
         """
         return len(self.seq_offsets)
 
     def _init_feat_info(self):
         """
         初始化特征信息, 包括特征缺省值和特征类型
-
-        Returns:
-            feat_default_value: 特征缺省值，每个元素为字典，key为特征ID，value为特征缺省值
-            feat_types: 特征类型，key为特征类型名称，value为包含的特征ID列表
         """
         feat_default_value = {}
         feat_statistics = {}
@@ -256,13 +238,6 @@ class MyDataset(torch.utils.data.Dataset):
     def fill_missing_feat(self, feat, item_id):
         """
         对于原始数据中缺失的特征进行填充缺省值
-
-        Args:
-            feat: 特征字典
-            item_id: 物品ID
-
-        Returns:
-            filled_feat: 填充后的特征字典
         """
         if feat == None:
             feat = {}
