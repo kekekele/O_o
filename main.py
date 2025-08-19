@@ -17,10 +17,10 @@ from dataset import MyDataset
 from model import BaselineModel
 
 # 可根据需要修改，或在外部设置
-os.environ.setdefault("TRAIN_LOG_PATH", "./logs")
-os.environ.setdefault("TRAIN_TF_EVENTS_PATH", "./logs/tf_events")
-os.environ.setdefault("TRAIN_DATA_PATH", "./data/TencentGR_1k")
-os.environ.setdefault("TRAIN_CKPT_PATH", "./result")
+# os.environ.setdefault("TRAIN_LOG_PATH", "./logs")
+# os.environ.setdefault("TRAIN_TF_EVENTS_PATH", "./logs/tf_events")
+# os.environ.setdefault("TRAIN_DATA_PATH", "./data/TencentGR_1k")
+# os.environ.setdefault("TRAIN_CKPT_PATH", "./result")
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -152,9 +152,9 @@ def InfoNCE(
     return loss, stats
 
 @torch.no_grad()
-def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=0.05):
+def evaluate_valid_score(model, valid_loader, device, temperature=0.05):
     """
-    在验证子集上计算 score = 0.31*HR@10 + 0.69*NDCG@10
+    在完整验证集上计算 score = 0.31*HR@10 + 0.69*NDCG@10
     使用近似候选集：对每个查询，候选集=该样本的正样本 + 本批所有负样本池（与 InfoNCE 一致）。
     """
     model.eval()
@@ -162,7 +162,7 @@ def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=
     total_dcg = 0.0
     total_queries = 0
 
-    for batch in valid_subset_loader:
+    for batch in valid_loader:
         # 解包
         (seq, pos, neg, token_type, next_token_type, next_action_type,
          seq_feat, pos_feat, neg_feat, seq_ts) = batch
@@ -188,7 +188,7 @@ def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=
         P = pos_embs[mask]    # [M,D]
         N = neg_embs[mask]    # [M,D] 批内负样本池
 
-        # 构造 logits（与 InfoNCE 一致的打分方式，不加温度缩放也可以）
+        # 构造 logits（与 InfoNCE 一致）
         pos_logits = (Q * P).sum(dim=-1, keepdim=True)  # [M,1]
         neg_logits = Q @ N.t()                          # [M,M]
         logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+M]
@@ -196,13 +196,10 @@ def evaluate_valid_subset_score(model, valid_subset_loader, device, temperature=
         # Top-k 命中与 NDCG
         k = min(10, logits.size(1))
         topk = torch.topk(logits, k=k, dim=1)
-        hits_bool = (topk.indices == 0)                 # [M,k] 是否包含正样本
+        hits_bool = (topk.indices == 0)                 # [M,k]
         hits_any = hits_bool.any(dim=1)                 # [M]
         total_hits += hits_any.float().sum().item()
 
-        # 正样本在 top-k 的位置 -> NDCG
-        # 若未命中 top-k，贡献为 0；若命中，位置 p 的 DCG=1/log2(p+2)
-        # 使用 argmax 找到第一个 True 的位置（未命中时值无效，但会被 hits_any 掩蔽）
         first_pos = torch.argmax(hits_bool.int(), dim=1)               # [M]
         dcg = hits_any.float() * (1.0 / torch.log2(first_pos.float() + 2.0))
         total_dcg += dcg.sum().item()
@@ -239,7 +236,7 @@ if __name__ == '__main__':
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [n_train, n_valid], generator=split_gen)
 
     # DataLoader
-    num_workers = 4
+    num_workers = 9
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -247,8 +244,8 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
-        persistent_workers=num_workers > 0,
         pin_memory=torch.cuda.is_available(),
+        prefetch_factor=6
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -257,25 +254,8 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
-        persistent_workers=num_workers > 0,
         pin_memory=torch.cuda.is_available(),
-    )
-    # 验证子集：随机采样 5% 用户
-    n_valid_total = len(valid_dataset)
-    n_valid_sub = max(1, int(n_valid_total * 0.05))
-    g_sub = torch.Generator().manual_seed(args.seed)  # 固定种子，保证可复现
-    perm = torch.randperm(n_valid_total, generator=g_sub)
-    valid_subset_idx = perm[:n_valid_sub].tolist()
-    valid_subset = torch.utils.data.Subset(valid_dataset, valid_subset_idx)
-    valid_subset_loader = DataLoader(
-        valid_subset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None,
-        collate_fn=dataset.collate_fn,
-        persistent_workers=num_workers > 0,
-        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=6
     )
 
     # 模型
@@ -306,10 +286,7 @@ if __name__ == '__main__':
     # 优化器与调度器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
     T_total = len(train_loader) * args.num_epochs
-    num_warmup_steps = int(T_total * 0.1)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=num_warmup_steps)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
+    scheduler = CosineAnnealingLR(optimizer, T_max=T_total, eta_min=1e-6)
 
     best_val_loss = float('inf')
     global_step = 0
@@ -354,29 +331,10 @@ if __name__ == '__main__':
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scheduler.step()
                 optimizer.step()
+                scheduler.step()
 
                 global_step += 1
-
-                # 每 5000 步在 5% 验证子集上评估 score
-                if global_step % 5000 == 0:
-                    prev_mode = model.training
-                    model.eval()
-                    with torch.no_grad():
-                        score = evaluate_valid_subset_score(
-                            model, valid_subset_loader, device=args.device, temperature=args.temperature
-                        )
-                    # 恢复训练/评估模式
-                    if prev_mode:
-                        model.train()
-                    writer.add_scalar('Score/valid_subset', score, global_step)
-                    log_json = json.dumps(
-                        {'global_step': global_step, 'valid_subset_score': float(score), 'time': time.time()}
-                    )
-                    print(log_json)
-                    log_file.write(log_json + '\n')
-                    log_file.flush()
 
             # 验证阶段（评估）
             model.eval()
@@ -405,8 +363,18 @@ if __name__ == '__main__':
             valid_loss_avg = valid_loss_sum / max(1, len(valid_loader))
             writer.add_scalar('Loss/valid', valid_loss_avg, global_step)
 
+            # 只在每个 epoch 结束后，在完整验证集上计算 score
+            score = evaluate_valid_score(model, valid_loader, device=args.device, temperature=args.temperature)
+            writer.add_scalar('Score/valid', score, global_step)
+            log_json = json.dumps(
+                {'global_step': global_step, 'epoch': epoch, 'valid_score': float(score), 'time': time.time()}
+            )
+            print(log_json)
+            log_file.write(log_json + '\n')
+            log_file.flush()
+
             # 保存 checkpoint
-            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_avg:.4f}")
+            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_avg:.4f}.score={score:.4f}")
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
 

@@ -3,6 +3,7 @@ import json
 import os
 import struct
 from pathlib import Path
+from typing import Dict, Tuple, List
 
 import numpy as np
 import torch
@@ -51,26 +52,17 @@ def get_args():
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
 
+    # Torch ANN（新增）
+    parser.add_argument('--top_k', default=10, type=int)
+    parser.add_argument('--torch_query_bs', default=None, type=int, help='查询分块大小（默认: cuda=1024, cpu=256）')
+    parser.add_argument('--torch_item_bs', default=None, type=int, help='库向量分块大小（默认: cuda=16384, cpu=8192）')
+    parser.add_argument('--use_fp16', action='store_true', help='在 CUDA 上使用半精度进行相似度计算')
+
+    # DataLoader workers（推理）
+    parser.add_argument('--num_workers', default=8, type=int)
+
     args = parser.parse_args()
-
     return args
-
-
-def read_result_ids(file_path):
-    with open(file_path, 'rb') as f:
-        # Read the header (num_points_query and FLAGS_query_ann_top_k)
-        num_points_query = struct.unpack('I', f.read(4))[0]  # uint32_t -> 4 bytes
-        query_ann_top_k = struct.unpack('I', f.read(4))[0]  # uint32_t -> 4 bytes
-
-        print(f"num_points_query: {num_points_query}, query_ann_top_k: {query_ann_top_k}")
-
-        # Calculate how many result_ids there are (num_points_query * query_ann_top_k)
-        num_result_ids = num_points_query * query_ann_top_k
-
-        # Read result_ids (uint64_t, 8 bytes per value)
-        result_ids = np.fromfile(f, dtype=np.uint64, count=num_result_ids)
-
-        return result_ids.reshape((num_points_query, query_ann_top_k))
 
 
 def process_cold_start_feat(feat):
@@ -96,14 +88,8 @@ def process_cold_start_feat(feat):
 
 def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
     """
-    生产候选库item的id和embedding
+    生产候选库item的id和embedding，并落盘 embedding.fbin / id.u64bin
 
-    Args:
-        indexer: 索引字典
-        feat_types: 特征类型，分为user和item的sparse, array, emb, continual类型
-        feature_default_value: 特征缺省值
-        mm_emb_dict: 多模态特征字典
-        model: 模型
     Returns:
         retrieve_id2creative_id: 索引id->creative_id的dict
     """
@@ -145,33 +131,140 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
     return retrieve_id2creative_id
 
 
+def read_matrix_bin(file_path: Path, dtype=np.float32) -> np.ndarray:
+    """
+    读取 save_emb 写出的 .fbin/.u64bin 文件（前两个 uint32 头：num_points, dim）
+    """
+    with open(file_path, 'rb') as f:
+        num_points = struct.unpack('I', f.read(4))[0]
+        dim = struct.unpack('I', f.read(4))[0]
+        arr = np.fromfile(f, dtype=dtype, count=num_points * dim)
+    return arr.reshape(num_points, dim)
+
+
+@torch.no_grad()
+def batched_topk_torch(
+    queries: torch.Tensor,         # [Q, D] (已归一化)
+    items: torch.Tensor,           # [I, D] (已归一化)
+    top_k: int,
+    device: torch.device,
+    query_bs: int,
+    item_bs: int,
+    use_fp16: bool = False,
+) -> torch.Tensor:
+    """
+    纯 PyTorch 分块 Top-K 检索：
+    - 双分块（查询/库）避免显存爆炸
+    - 对每个查询批，跨库分块维护运行中 top-k（二次 topk 合并）
+
+    Returns:
+        topk_indices: LongTensor [Q, top_k]，为 items 的下标（0..I-1）
+    """
+    Q, D = queries.shape
+    I, D2 = items.shape
+    assert D == D2, f"Dim mismatch: {D} vs {D2}"
+
+    # 设备/精度
+    on_cuda = (device.type == 'cuda')
+    if on_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    dtype = torch.float16 if (use_fp16 and on_cuda) else torch.float32
+
+    # 预分配输出
+    out_indices = torch.empty((Q, top_k), dtype=torch.long)
+
+    # 为了减少拷贝，items 按块搬到 device
+    for q_start in tqdm(range(0, Q, query_bs), desc='ANN(query-chunks)'):
+        q_end = min(q_start + query_bs, Q)
+        q_chunk = queries[q_start:q_end].to(device=device, dtype=dtype, non_blocking=True)  # [qb, D]
+        qb = q_chunk.shape[0]
+
+        # 当前查询块的全局 top-k（逐库块更新）
+        best_scores = torch.full((qb, top_k), -1e9, device=device, dtype=torch.float32)
+        best_indices = torch.full((qb, top_k), -1, device=device, dtype=torch.long)
+
+        for i_start in range(0, I, item_bs):
+            i_end = min(i_start + item_bs, I)
+            item_block = items[i_start:i_end].to(device=device, dtype=dtype, non_blocking=True)  # [ib, D]
+            ib = item_block.shape[0]
+
+            # 相似度（已归一化 -> 余弦 == 点积）
+            sims = torch.matmul(q_chunk, item_block.t())  # [qb, ib]
+            sims32 = sims.float()  # 合并与存储都用 fp32，稳定一些
+
+            # 库块内 top-k（若 ib < top_k，取 ib）
+            k_local = min(top_k, ib)
+            block_scores, block_pos = torch.topk(sims32, k=k_local, dim=1)        # [qb, k_local]
+            block_indices = (block_pos + i_start)                                  # [qb, k_local]
+
+            # 合并当前 best 与 block top-k -> 再取 top-k
+            comb_scores = torch.cat([best_scores, block_scores], dim=1)            # [qb, 2k]
+            comb_indices = torch.cat([best_indices, block_indices], dim=1)         # [qb, 2k]
+            best_scores, sel = torch.topk(comb_scores, k=top_k, dim=1)             # [qb, k], [qb, k]
+            best_indices = torch.gather(comb_indices, 1, sel)                      # [qb, k]
+
+            del sims, sims32, block_scores, block_pos, block_indices, comb_scores, comb_indices, sel
+            if on_cuda:
+                torch.cuda.empty_cache()
+
+        out_indices[q_start:q_end] = best_indices.cpu()
+
+        del q_chunk, best_scores, best_indices
+        if on_cuda:
+            torch.cuda.empty_cache()
+
+    return out_indices  # [Q, top_k]
+
+
 def infer():
     args = get_args()
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
+
+    # 设定分块默认值
+    if args.torch_query_bs is None:
+        args.torch_query_bs = 1024 if device.type == 'cuda' else 256
+    if args.torch_item_bs is None:
+        args.torch_item_bs = 16384 if device.type == 'cuda' else 8192
+
     data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=test_dataset.collate_fn,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(device)
     model.eval()
 
     ckpt_path = get_ckpt_path()
-    model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+    # 生成查询（用户）向量
     all_embs = []
     user_list = []
-    for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
-
+    for step, batch in tqdm(enumerate(test_loader), total=len(test_loader), desc='Encoding queries'):
         seq, token_type, seq_feat, user_id, seq_ts = batch
-        seq = seq.to(args.device)
-        logits = model.predict(seq, seq_feat, token_type, seq_ts)
-        for i in range(logits.shape[0]):
-            emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
-            all_embs.append(emb)
+        seq = seq.to(device, non_blocking=True)
+        # 注意：若采用“预张量化特征字典”的 Dataset 版本，seq_feat 内部张量需要按需搬到 GPU，
+        # 模型内部会调用 .to(self.dev) 统一处理；此处保持原封不动地传入。
+        with torch.no_grad():
+            emb = model.predict(seq, seq_feat, token_type, seq_ts)  # [B, D]，已归一化
+        all_embs.append(emb.detach().cpu().numpy().astype(np.float32))
         user_list += user_id
 
-    # 生成候选库的embedding 以及 id文件
+    all_embs = np.concatenate(all_embs, axis=0)  # [Q, D]
+    # 可选：保存 query 文件（兼容旧流程/调试用）
+    save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
+
+    # 生成候选库的embedding 以及 id文件（embedding.fbin / id.u64bin）
     retrieve_id2creative_id = get_candidate_emb(
         test_dataset.indexer['i'],
         test_dataset.feature_types,
@@ -179,31 +272,41 @@ def infer():
         test_dataset.mm_emb_dict,
         model,
     )
-    all_embs = np.concatenate(all_embs, axis=0)
-    # 保存query文件
-    save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
-    # ANN 检索
-    ann_cmd = (
-        str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
-        + " --dataset_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin"))
-        + " --dataset_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin"))
-        + " --query_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "query.fbin"))
-        + " --result_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-        + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
-    )
-    os.system(ann_cmd)
 
-    # 取出top-k
-    top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-    top10s_untrimmed = []
-    for top10 in tqdm(top10s_retrieved):
-        for item in top10:
-            top10s_untrimmed.append(retrieve_id2creative_id.get(int(item), 0))
+    # 读取候选库向量与检索ID
+    emb_path = Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin")
+    id_path = Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin")
+    item_embs = read_matrix_bin(emb_path, dtype=np.float32)       # [I, D]
+    item_ids_u64 = read_matrix_bin(id_path, dtype=np.uint64).reshape(-1)  # [I]
+    assert item_embs.shape[0] == item_ids_u64.shape[0], "embedding 与 id 数量不一致"
 
-    top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
+    # 转为 torch，准备检索
+    queries_t = torch.from_numpy(all_embs)        # [Q, D] 已归一化
+    items_t = torch.from_numpy(item_embs)         # [I, D] 已归一化
+
+    # 分块 Top-K
+    topk_idx = batched_topk_torch(
+        queries=queries_t,
+        items=items_t,
+        top_k=args.top_k,
+        device=device,
+        query_bs=args.torch_query_bs,
+        item_bs=args.torch_item_bs,
+        use_fp16=args.use_fp16,
+    )  # [Q, top_k] 索引（对齐 item_embs / item_ids_u64）
+
+    # 映射为检索ID -> creative_id
+    top10s: List[List[int]] = []
+    I = item_ids_u64.shape[0]
+    for row in topk_idx.numpy():
+        row_creative: List[int] = []
+        for col in row:
+            idx = int(col)
+            if 0 <= idx < I:
+                rid = int(item_ids_u64[idx])
+                row_creative.append(retrieve_id2creative_id.get(rid, 0))
+            else:
+                row_creative.append(0)
+        top10s.append(row_creative)
 
     return top10s, user_list
