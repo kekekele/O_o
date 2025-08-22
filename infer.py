@@ -42,8 +42,6 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', default=False, action='store_true')
-    parser.add_argument('--ts_num_buckets', default=128, type=int)
 
     # Loss
     parser.add_argument('--temperature', default=0.05, type=float)
@@ -86,6 +84,36 @@ def process_cold_start_feat(feat):
     return processed_feat
 
 
+def _load_click_bucket_map_for_infer() -> Dict[int, int]:
+    """
+    加载 item_click_bucket.json（方案A）
+    搜索顺序：
+      - USER_CACHE_PATH
+      - EVAL_RESULT_PATH
+      - MODEL_OUTPUT_PATH
+      - TRAIN_CKPT_PATH
+      - EVAL_DATA_PATH
+    返回：{item_reid: bucket}
+    """
+    candidates: List[Path] = []
+    env_keys = ["USER_CACHE_PATH", "EVAL_RESULT_PATH", "MODEL_OUTPUT_PATH", "TRAIN_CKPT_PATH", "EVAL_DATA_PATH"]
+    for k in env_keys:
+        v = os.environ.get(k, None)
+        if v:
+            candidates.append(Path(v) / "item_click_bucket.json")
+    for p in candidates:
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                print(f"Loaded item_click_bucket.json from {p}")
+                return {int(k): int(v) for k, v in d.items()}
+        except Exception as e:
+            print(f"warn: failed reading {p}: {e}")
+    print("warn: item_click_bucket.json not found. Will use bucket=0 as fallback.")
+    return {}
+
+
 def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
     """
     生产候选库item的id和embedding，并落盘 embedding.fbin / id.u64bin
@@ -97,6 +125,9 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
     candidate_path = Path(os.environ.get('EVAL_DATA_PATH'), 'predict_set.jsonl')
     item_ids, creative_ids, retrieval_ids, features = [], [], [], []
     retrieve_id2creative_id = {}
+
+    # 载入点击桶映射（可为空）
+    click_bucket_map = _load_click_bucket_map_for_infer()
 
     with open(candidate_path, 'r') as f:
         for line in f:
@@ -117,6 +148,12 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
                     feature[feat_id] = mm_emb_dict[feat_id][creative_id]
                 else:
                     feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
+
+            # 新增：点击次数分桶（901）。若不在统计文件中，回退 0。
+            try:
+                feature['901'] = int(click_bucket_map.get(int(item_id), 0))
+            except Exception:
+                feature['901'] = 0
 
             item_ids.append(item_id)
             creative_ids.append(creative_id)

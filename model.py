@@ -63,7 +63,7 @@ class HSTU(torch.nn.Module):
 
         self.qkvu_linear = torch.nn.Sequential(torch.nn.Linear(hidden_units, hidden_units * 4),
                                                torch.nn.SiLU())
-        # self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.out_linear = torch.nn.Linear(hidden_units * 3, hidden_units)
 
     def forward(self, x, attn_mask=None):
@@ -84,9 +84,8 @@ class HSTU(torch.nn.Module):
 
         attn_output = torch.matmul(attn_weights, V)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-        # output = self.out_linear(attn_output * U)
         output = self.out_linear(torch.cat([U, attn_output, attn_output * U], dim=-1))
-        output = F.dropout(output, p=self.dropout_rate, training=self.training)
+        # output = F.dropout(output, p=self.dropout_rate, training=self.training)
         output = self.rms_norm(output + x)  # DeepNorm
         return output
 
@@ -152,7 +151,6 @@ class BaselineModel(torch.nn.Module):
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
-        self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
 
@@ -291,7 +289,7 @@ class BaselineModel(torch.nn.Module):
         seqs += self.pos_emb(poss)
 
         # =========== 绝对时间编码 + 三个周期特征 ===========
-        ts = seq_ts.to(self.dev).long()  # [B,S] 绝对时间戳（秒）
+        ts = seq_ts.to(self.dev, non_blocking=True)  # [B,S] 绝对时间戳（秒）
         valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S] True=有效token
 
         # 周期时间特征：hour(1..24), dow(1..7, ISO: 周一=1), is_weekend(1=工作日, 2=周末)

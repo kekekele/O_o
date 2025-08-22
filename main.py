@@ -41,7 +41,6 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', default=False, action='store_true')
 
     parser.add_argument('--temperature', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
@@ -92,8 +91,8 @@ def InfoNCE(
     temperature: float,               # > 0
     next_token_type: torch.Tensor,    # [B, L]，1 表示 item
     next_action_type: torch.Tensor,   # [B, L]，下一个token动作类型，0表示曝光，1表示点击
-    click_scale: float = 2.0,  # 点击样本损失权重
-    exp_scale: float = 0.5,  # 曝光样本损失权重
+    click_scale: float = 1.0,  # 点击样本损失权重
+    exp_scale: float = 0.1,  # 曝光样本损失权重
 ):
     """
     Batch-all negatives InfoNCE（余弦相似度，负样本分母+1，负样本朝 -1 优化）
@@ -120,15 +119,13 @@ def InfoNCE(
         }
 
     # 正样本相似度与 logit（不做动作缩放）
-    # 若需要归一化向量获得真正余弦，请确保上游已做 normalize 或在此加 F.normalize
-    pos_sim    = (Qn * Kpn).sum(dim=-1, keepdim=True)           # [M,1] ∈[-1,1]
+    pos_sim    = (Qn * Kpn).sum(dim=-1, keepdim=True)           # [M,1]
     pos_logits = pos_sim / temperature                          # [M,1]
 
     # 负样本相似度与“分母+1”的变换（保持你的原设计）
-    neg_sim    = Qn @ Knegn.t()                                 # [M,M] ∈[-1,1]
-    neg_logits = neg_sim / temperature   # [M,M]
+    neg_sim    = Qn @ Knegn.t()                                 # [M,M]
+    neg_logits = neg_sim / temperature                          # [M,M]
 
-    # 拼接 logits
     logits = torch.cat([pos_logits, neg_logits], dim=1)         # [M, 1+M]
     labels = torch.zeros(M, dtype=torch.long, device=device)
 
@@ -139,10 +136,10 @@ def InfoNCE(
         torch.full_like(act_f, click_scale),
         torch.full_like(act_f, exp_scale)
     )  # [M]
+    sample_weight = sample_weight / sample_weight.sum()
 
-    # 逐样本 CE，再按权重归一化
-    per_example_loss = F.cross_entropy(logits, labels, reduction='none')  # [M]
-    loss = (per_example_loss * sample_weight).mean()
+    per_example_loss = torch.nn.functional.cross_entropy(logits, labels, reduction='none')  # [M]
+    loss = (per_example_loss * sample_weight).sum()
 
     stats = {
         'mean_pos_sim': float(pos_sim.mean().item()),
@@ -151,19 +148,19 @@ def InfoNCE(
 
     return loss, stats
 
+
 @torch.no_grad()
-def evaluate_valid_score(model, valid_loader, device, temperature=0.05):
+def evaluate_acc1(model, valid_loader, device, temperature=0.05):
     """
-    在完整验证集上计算 score = 0.31*HR@10 + 0.69*NDCG@10
-    使用近似候选集：对每个查询，候选集=该样本的正样本 + 本批所有负样本池（与 InfoNCE 一致）。
+    更快速的评估：acc@1（top-1 命中率）
+    候选集与训练 InfoNCE 一致：每个查询的候选集=其正样本 + 批内 item 位置的负样本池。
+    仅在点击位置(next_action_type==1)计算。
     """
     model.eval()
-    total_hits = 0.0
-    total_dcg = 0.0
-    total_queries = 0
+    total = 0
+    correct = 0
 
     for batch in valid_loader:
-        # 解包
         (seq, pos, neg, token_type, next_token_type, next_action_type,
          seq_feat, pos_feat, neg_feat, seq_ts) = batch
 
@@ -172,47 +169,37 @@ def evaluate_valid_score(model, valid_loader, device, temperature=0.05):
         neg = neg.to(device)
         token_type = token_type.to(device)
         next_token_type = next_token_type.to(device)
+        next_action_type = next_action_type.to(device)
 
-        # 前向
         pos_embs, neg_embs, log_feats = model(
             seq, pos, neg, token_type, next_token_type, next_action_type,
             seq_feat, pos_feat, neg_feat, seq_ts
         )  # [B,L,D] x3
 
-        # 只评 item 位置
-        mask = (next_token_type == 1)
+        # 只评估点击的 item 位置
+        mask = (next_token_type == 1) & (next_action_type == 1)
         if mask.sum().item() == 0:
             continue
 
-        Q = log_feats[mask]   # [M,D]
-        P = pos_embs[mask]    # [M,D]
-        N = neg_embs[mask]    # [M,D] 批内负样本池
+        Q = log_feats[mask]                       # [M,D]
+        P = pos_embs[mask]                        # [M,D]
+        N = neg_embs[next_token_type == 1]        # [N,D] 批内负样本池
 
-        # 构造 logits（与 InfoNCE 一致）
+        # logits: 将正样本放在 index=0，其他为负样本
         pos_logits = (Q * P).sum(dim=-1, keepdim=True)  # [M,1]
-        neg_logits = Q @ N.t()                          # [M,M]
-        logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+M]
+        if N.numel() == 0:
+            logits = pos_logits
+        else:
+            neg_logits = Q @ N.t()                        # [M,N]
+            logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+N]
 
-        # Top-k 命中与 NDCG
-        k = min(10, logits.size(1))
-        topk = torch.topk(logits, k=k, dim=1)
-        hits_bool = (topk.indices == 0)                 # [M,k]
-        hits_any = hits_bool.any(dim=1)                 # [M]
-        total_hits += hits_any.float().sum().item()
+        pred = torch.argmax(logits, dim=1)  # 预测索引
+        correct += (pred == 0).sum().item()
+        total += logits.size(0)
 
-        first_pos = torch.argmax(hits_bool.int(), dim=1)               # [M]
-        dcg = hits_any.float() * (1.0 / torch.log2(first_pos.float() + 2.0))
-        total_dcg += dcg.sum().item()
-
-        total_queries += logits.size(0)
-
-    if total_queries == 0:
+    if total == 0:
         return 0.0
-
-    hr10 = total_hits / total_queries
-    ndcg10 = total_dcg / total_queries
-    score = 0.31 * hr10 + 0.69 * ndcg10
-    return score
+    return correct / total
 
 if __name__ == '__main__':
     # 路径与日志
@@ -235,8 +222,35 @@ if __name__ == '__main__':
     split_gen = torch.Generator().manual_seed(args.seed)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [n_train, n_valid], generator=split_gen)
 
+    # 在训练开始前，导出 item 点击分桶映射供推理使用（方案A）
+    try:
+        bucket = {}
+        for iid in range(1, dataset.itemnum + 1):
+            cnt = int(getattr(dataset, 'item_click_counts', np.zeros(1))[iid])
+            b = int(dataset._click_count_to_bucket(cnt)) if hasattr(dataset, '_click_count_to_bucket') else 1
+            bucket[iid] = b
+        # 保存到 USER_CACHE_PATH（优先），回退到 TRAIN_CKPT_PATH
+        cache_root = os.environ.get("USER_CACHE_PATH", None)
+        out_paths = []
+        if cache_root:
+            Path(cache_root).mkdir(parents=True, exist_ok=True)
+            out_paths.append(Path(cache_root) / "item_click_bucket.json")
+        ckpt_root = os.environ.get("TRAIN_CKPT_PATH", None)
+        if ckpt_root:
+            Path(ckpt_root).mkdir(parents=True, exist_ok=True)
+            out_paths.append(Path(ckpt_root) / "item_click_bucket.json")
+        # 若都没有环境变量，则默认存到当前目录
+        if not out_paths:
+            out_paths.append(Path("./item_click_bucket.json"))
+        for p in out_paths:
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(bucket, f)
+            print(f"Saved item_click_bucket.json -> {p}")
+    except Exception as e:
+        print(f'warn: failed to dump item_click_bucket.json: {e}')
+
     # DataLoader
-    num_workers = 9
+    num_workers = 8
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -262,6 +276,7 @@ if __name__ == '__main__':
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     # 模块初始化
     model.apply(init_weights)
@@ -286,7 +301,10 @@ if __name__ == '__main__':
     # 优化器与调度器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
     T_total = len(train_loader) * args.num_epochs
-    scheduler = CosineAnnealingLR(optimizer, T_max=T_total, eta_min=1e-6)
+    num_warmup_steps = int(T_total * 0.1)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=num_warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
 
     best_val_loss = float('inf')
     global_step = 0
@@ -336,7 +354,7 @@ if __name__ == '__main__':
 
                 global_step += 1
 
-            # 验证阶段（评估）
+            # 验证阶段（评估 loss）
             model.eval()
             valid_loss_sum = 0.0
             with torch.no_grad():
@@ -363,21 +381,21 @@ if __name__ == '__main__':
             valid_loss_avg = valid_loss_sum / max(1, len(valid_loader))
             writer.add_scalar('Loss/valid', valid_loss_avg, global_step)
 
-            # 只在每个 epoch 结束后，在完整验证集上计算 score
-            score = evaluate_valid_score(model, valid_loader, device=args.device, temperature=args.temperature)
-            writer.add_scalar('Score/valid', score, global_step)
+            # 用更快的 acc@1 评估
+            acc1 = evaluate_acc1(model, valid_loader, device=args.device, temperature=args.temperature)
+            writer.add_scalar('Acc1/valid', acc1, global_step)
             log_json = json.dumps(
-                {'global_step': global_step, 'epoch': epoch, 'valid_score': float(score), 'time': time.time()}
+                {'global_step': global_step, 'epoch': epoch, 'valid_acc1': float(acc1), 'time': time.time()}
             )
             print(log_json)
             log_file.write(log_json + '\n')
             log_file.flush()
 
-            # 保存 checkpoint
-            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_avg:.4f}.score={score:.4f}")
+            # 保存 checkpoint（文件名包含 acc1）
+            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'),
+                            f"global_step{global_step}.valid_loss={valid_loss_avg:.4f}.acc1={acc1:.4f}")
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
-
 
     print("Done")
     writer.close()

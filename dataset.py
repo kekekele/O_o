@@ -1,6 +1,8 @@
 import json
 import pickle
 import struct
+import math
+import os
 from pathlib import Path
 from collections import OrderedDict
 import numpy as np
@@ -75,6 +77,11 @@ class MyDataset(torch.utils.data.Dataset):
         _clip_ids = self.valid_item_ids[self.valid_item_ids <= self.itemnum]
         self.valid_item_mask[_clip_ids] = True
 
+        # 统计点击并准备分桶映射
+        self.CLICK_BUCKETS = 16
+        self.item_click_counts = self._compute_item_click_counts()
+        self._click_bucket_map = self._load_click_bucket_map()
+
         # 加载多模态特征为致密矩阵（feat_id -> np.ndarray[item_reid, dim]）
         self.mm_emb_mats, self.mm_emb_dict = load_mm_emb(
             Path(data_dir, "creative_emb"),
@@ -140,6 +147,83 @@ class MyDataset(torch.utils.data.Dataset):
                 return cand
         return 0
 
+    # ======================== 新增：点击统计与分桶工具 ========================
+
+    def _compute_item_click_counts(self):
+        """
+        统计每个 item 的点击次数（action_type==1）；
+        优先从 data_dir/seq.jsonl 读取，否则回退到当前数据文件（如 predict_seq.jsonl）。
+        """
+        counts = np.zeros(self.itemnum + 1, dtype=np.int32)
+        prefer = self.data_dir / "seq.jsonl"
+        use_path = prefer if prefer.exists() else self._data_file_path
+        try:
+            with open(use_path, 'rb') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        seq = JSON_LOADS(line)
+                    except Exception:
+                        continue
+                    # record: [user_id, item_id, user_feat, item_feat, action_type, timestamp]
+                    for rec in seq:
+                        if not isinstance(rec, (list, tuple)) or len(rec) < 6:
+                            continue
+                        i = rec[1]
+                        a = rec[4]
+                        if isinstance(i, int) and 0 < i <= self.itemnum and a == 1:
+                            counts[i] += 1
+        except FileNotFoundError:
+            pass
+        return counts
+
+    def _click_count_to_bucket(self, c: int) -> int:
+        """
+        将点击次数映射到 [1..CLICK_BUCKETS] 的对数分桶；0 次并非 pad，这里归入第1桶。
+        pad 位置由上游 token_type 控制；item_id=0 时返回 0。
+        """
+        if c <= 0:
+            return 1
+        b = int(math.floor(math.log2(c))) + 1
+        return int(max(1, min(self.CLICK_BUCKETS, b)))
+
+    def _map_action_to_id(self, a) -> int:
+        """
+        将原始 action_type（0=曝光，1=点击，或 None）映射到嵌入索引：
+        0=pad，1=曝光，2=点击
+        """
+        if a is None:
+            return 0
+        return 1 if int(a) == 0 else 2
+
+    def _load_click_bucket_map(self):
+        """
+        装载 item_click_bucket.json，优先从 USER_CACHE_PATH，其次 TRAIN_CKPT_PATH、数据目录。
+        返回 {item_reid: bucket_int}
+        """
+        candidates = []
+        cache_root = os.environ.get("USER_CACHE_PATH", None)
+        if cache_root:
+            candidates.append(Path(cache_root) / "item_click_bucket.json")
+        ckpt_root = os.environ.get("TRAIN_CKPT_PATH", None)
+        if ckpt_root:
+            candidates.append(Path(ckpt_root) / "item_click_bucket.json")
+        candidates.append(self.data_dir / "item_click_bucket.json")
+
+        for p in candidates:
+            try:
+                if p.exists():
+                    with open(p, 'r', encoding='utf-8') as f:
+                        d = json.load(f)
+                    print(f"Loaded click bucket map from {p}")
+                    return {int(k): int(v) for k, v in d.items()}
+            except Exception as e:
+                print(f"warn: failed loading {p}: {e}")
+        return {}
+
+    # ======================================================================
+
     def __getitem__(self, uid):
         """
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
@@ -196,6 +280,9 @@ class MyDataset(torch.utils.data.Dataset):
             # 当前 token 特征（基于全量模板）
             if type_ == 1:
                 feat_filled = self._make_item_feat(i, feat)
+                # 动态加入 action_type 嵌入索引 '900'（0=pad,1=曝光,2=点击）
+                feat_filled = feat_filled.copy()
+                feat_filled['900'] = self._map_action_to_id(act_type)
             else:
                 feat_filled = self._make_user_feat(feat)
 
@@ -264,6 +351,9 @@ class MyDataset(torch.utils.data.Dataset):
             '122',
             '116',
         ]
+        # 新增：action_type（900）与点击次数分桶（901）
+        feat_types['item_sparse'] += ['900', '901']
+
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
@@ -274,6 +364,9 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = 0
             feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
         for feat_id in feat_types['item_sparse']:
+            if feat_id in ('900', '901'):
+                # 在下方分别填充
+                continue
             feat_default_value[feat_id] = 0
             feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
         for feat_id in feat_types['item_array']:
@@ -291,6 +384,14 @@ class MyDataset(torch.utils.data.Dataset):
             emb_dim = self.mm_emb_mats[feat_id].shape[1]
             feat_default_value[feat_id] = np.zeros(emb_dim, dtype=np.float32)
 
+        # 新增字段的默认与统计
+        # 900: action_type（0=pad, 1=曝光, 2=点击） -> 2 类，Embedding 侧 +1 预留 pad
+        feat_default_value['900'] = 0
+        feat_statistics['900'] = 2
+        # 901: 点击次数分桶（[1..CLICK_BUCKETS]，0=pad）
+        feat_default_value['901'] = 0
+        feat_statistics['901'] = self.CLICK_BUCKETS
+
         return feat_default_value, feat_types, feat_statistics
 
     def _build_feat_templates(self):
@@ -305,8 +406,9 @@ class MyDataset(torch.utils.data.Dataset):
 
     def _make_item_feat(self, item_id, base_feat_dict):
         """
-        仅组合非 item_emb 字段；item_emb 不再放入字典，避免大向量复制。
-        LRU 缓存只存这些轻量字段。
+        仅组合非 item_emb 字段；
+        新增：写入 '901'（item 点击次数分桶，静态，与 item_id 相关且可缓存）。
+        优先使用 _click_bucket_map；若无则用本地统计；仍无则置 0。
         """
         cache = self._item_feat_cache
         if item_id in cache:
@@ -320,10 +422,19 @@ class MyDataset(torch.utils.data.Dataset):
         if base_feat_dict:
             filled.update(base_feat_dict)
 
-        # 关键：不再把多模态向量塞进字典
-        # if item_id != 0 and 0 <= item_id <= self.itemnum:
-        #     for fid, mat in self.mm_emb_mats.items():
-        #         filled[fid] = mat[item_id]
+        # 写入静态点击分桶 '901'
+        if isinstance(item_id, int) and 0 < item_id <= self.itemnum:
+            if self._click_bucket_map:
+                filled['901'] = int(self._click_bucket_map.get(item_id, 0))
+                if filled['901'] == 0:
+                    # 若映射中没有该 item，回退到本地统计
+                    cnt = int(self.item_click_counts[item_id]) if hasattr(self, 'item_click_counts') else 0
+                    filled['901'] = self._click_count_to_bucket(cnt) if cnt > 0 else 0
+            else:
+                cnt = int(self.item_click_counts[item_id]) if hasattr(self, 'item_click_counts') else 0
+                filled['901'] = self._click_count_to_bucket(cnt) if cnt > 0 else 0
+        else:
+            filled['901'] = 0
 
         # 放入 LRU（存一份轻量 copy）
         cache[item_id] = filled.copy()
@@ -354,25 +465,15 @@ class MyDataset(torch.utils.data.Dataset):
                 filled[fid] = mat[item_id]
         return filled
 
-    def _tensorize_feature_list(self, feat_list, ids=None, token_type=None):
+    def _tensorize_feature_list(self, feat_list, ids=None, token_type=None, groups=None):
         """
-        将批内的“字典数组”特征转为稠密张量，便于 DataLoader(num_workers>0) 并行处理。
-
-        Args:
-            feat_list: list 长度 B，每个元素是长度 S 的数组（dtype=object），每个位置是字典
-
-        Returns:
-            feat_tensors: dict，结构为：
-                {
-                  'item_sparse': {fid: LongTensor[B,S]},
-                  'user_sparse': {fid: LongTensor[B,S]},
-                  'item_array':  {fid: LongTensor[B,S,A]},
-                  'user_array':  {fid: LongTensor[B,S,A]},
-                  'item_continual': {fid: FloatTensor[B,S]},
-                  'user_continual': {fid: FloatTensor[B,S]},
-                  'item_emb':    {fid: FloatTensor[B,S,D]},
-                }
+        向量化张量化：将批内“字典数组”转为稠密张量。
+        groups: 只构建需要的组，缺省构建全部。
         """
+        if groups is None:
+            groups = ['item_sparse', 'user_sparse', 'item_array', 'user_array',
+                      'item_continual', 'user_continual', 'item_emb']
+
         B = len(feat_list)
         S = len(feat_list[0]) if B > 0 else 0
 
@@ -385,38 +486,55 @@ class MyDataset(torch.utils.data.Dataset):
             'user_continual': {},
             'item_emb': {},
         }
-
         ft = self.feature_types
 
-        # sparse
-        for group, key in [('item_sparse', 'item_sparse'), ('user_sparse', 'user_sparse')]:
-            for fid in ft[key]:
+        # 将 feat_list 拍平成 2D 访问视图以减少 Python 循环开销
+        # flat_feat[b, s] -> dict
+        # 仍然保留两层循环，但字段内不再循环每个位置
+        # 1) sparse
+        if 'item_sparse' in groups:
+            for fid in ft['item_sparse']:
                 arr = np.zeros((B, S), dtype=np.int64)
                 for b in range(B):
                     row = feat_list[b]
-                    for s in range(S):
-                        v = row[s].get(fid, 0)
-                        if isinstance(v, list):
-                            # 存在异常数据，将 list 取第一个值或置 0
-                            arr[b, s] = v[0] if len(v) > 0 else 0
-                        else:
-                            arr[b, s] = int(v)
-                out[group][fid] = torch.from_numpy(arr)
+                    # 向量化读取：把这一行所有 s 的 fid 值拉出来
+                    vals = [row[s].get(fid, 0) for s in range(S)]
+                    # 处理 list -> 取首元素；非数值 -> 0
+                    v = np.fromiter(
+                        (int(v[0] if isinstance(v, list) and len(v) > 0 else (0 if isinstance(v, list) else int(v)))
+                         for v in vals),
+                        count=S, dtype=np.int64
+                    )
+                    arr[b] = v
+                out['item_sparse'][fid] = torch.from_numpy(arr)
 
-        # array：需先统计每个 fid 的最大长度
-        for group, key in [('item_array', 'item_array'), ('user_array', 'user_array')]:
-            for fid in ft[key]:
+        if 'user_sparse' in groups:
+            for fid in ft['user_sparse']:
+                arr = np.zeros((B, S), dtype=np.int64)
+                for b in range(B):
+                    row = feat_list[b]
+                    vals = [row[s].get(fid, 0) for s in range(S)]
+                    v = np.fromiter(
+                        (int(v[0] if isinstance(v, list) and len(v) > 0 else (0 if isinstance(v, list) else int(v)))
+                         for v in vals),
+                        count=S, dtype=np.int64
+                    )
+                    arr[b] = v
+                out['user_sparse'][fid] = torch.from_numpy(arr)
+
+        # 2) array：两遍扫描 -> 先求 max_len，再一次性填充
+        if 'item_array' in groups:
+            for fid in ft['item_array']:
+                # 求 max_len
                 max_len = 1
                 for b in range(B):
                     row = feat_list[b]
+                    # 拉平这一行的长度
                     for s in range(S):
                         v = row[s].get(fid, [0])
                         if isinstance(v, list):
                             if len(v) > max_len:
                                 max_len = len(v)
-                        else:
-                            # 容错：若不是 list，则视为单值
-                            max_len = max(max_len, 1)
                 arr = np.zeros((B, S, max_len), dtype=np.int64)
                 for b in range(B):
                     row = feat_list[b]
@@ -428,41 +546,68 @@ class MyDataset(torch.utils.data.Dataset):
                                 arr[b, s, :L] = np.asarray(v[:L], dtype=np.int64)
                         else:
                             arr[b, s, 0] = int(v)
-                out[group][fid] = torch.from_numpy(arr)
+                out['item_array'][fid] = torch.from_numpy(arr)
 
-        # continual
-        for group, key in [('item_continual', 'item_continual'), ('user_continual', 'user_continual')]:
-            for fid in ft[key]:
-                arr = np.zeros((B, S), dtype=np.float32)
+        if 'user_array' in groups:
+            for fid in ft['user_array']:
+                max_len = 1
                 for b in range(B):
                     row = feat_list[b]
                     for s in range(S):
-                        v = row[s].get(fid, 0.0)
-                        try:
-                            arr[b, s] = float(v)
-                        except Exception:
-                            arr[b, s] = 0.0
-                out[group][fid] = torch.from_numpy(arr)
+                        v = row[s].get(fid, [0])
+                        if isinstance(v, list):
+                            if len(v) > max_len:
+                                max_len = len(v)
+                arr = np.zeros((B, S, max_len), dtype=np.int64)
+                for b in range(B):
+                    row = feat_list[b]
+                    for s in range(S):
+                        v = row[s].get(fid, [0])
+                        if isinstance(v, list):
+                            L = min(len(v), max_len)
+                            if L > 0:
+                                arr[b, s, :L] = np.asarray(v[:L], dtype=np.int64)
+                        else:
+                            arr[b, s, 0] = int(v)
+                out['user_array'][fid] = torch.from_numpy(arr)
 
-        # item_emb（直接用 ids 索引 mm_emb 矩阵，避免从字典读大向量）
-        for fid in self.feature_types['item_emb']:
-            dim = int(self.feature_default_value[fid].shape[0])
-            if ids is not None:
-                ids_np = np.asarray(ids, dtype=np.int64)  # [B,S]
-                mat = self.mm_emb_mats[fid]  # [itemnum+1, dim]
-                arr = mat[ids_np]  # [B,S,dim]
-                if token_type is not None:
-                    tt = np.asarray(token_type, dtype=np.int64)  # [B,S]
-                    mask = (tt == 1).astype(np.float32)  # 仅 item 位置保留
-                    arr = arr * mask[..., None]
-                out['item_emb'][fid] = torch.from_numpy(arr)
-            else:
-                # 回退：无 ids 就给 0 构造（训练流程不会走到这里）
-                out['item_emb'][fid] = torch.zeros(
-                    (len(feat_list), len(feat_list[0]) if len(feat_list) > 0 else 0, dim),
-                    dtype=torch.float32
-                )
+        # 3) continual：一次性 fromiter 转换 float32
+        if 'item_continual' in groups:
+            for fid in ft['item_continual']:
+                arr = np.zeros((B, S), dtype=np.float32)
+                for b in range(B):
+                    row = feat_list[b]
+                    vals = [row[s].get(fid, 0.0) for s in range(S)]
+                    v = np.fromiter(
+                        ((float(v) if isinstance(v, (int, float, np.number)) else 0.0) for v in vals),
+                        count=S, dtype=np.float32
+                    )
+                    arr[b] = v
+                out['item_continual'][fid] = torch.from_numpy(arr)
 
+        if 'user_continual' in groups:
+            for fid in ft['user_continual']:
+                arr = np.zeros((B, S), dtype=np.float32)
+                for b in range(B):
+                    row = feat_list[b]
+                    vals = [row[s].get(fid, 0.0) for s in range(S)]
+                    v = np.fromiter(
+                        ((float(v) if isinstance(v, (int, float, np.number)) else 0.0) for v in vals),
+                        count=S, dtype=np.float32
+                    )
+                    arr[b] = v
+                out['user_continual'][fid] = torch.from_numpy(arr)
+
+        if 'item_emb' in groups:
+            for fid in self.feature_types['item_emb']:
+                dim = int(self.feature_default_value[fid].shape[0])
+                if ids is not None:
+                    ids_np = np.asarray(ids, dtype=np.int64)  # [B,S]
+                    mat = self.mm_emb_mats[fid]  # [itemnum+1, dim] (float32)
+                    arr = mat[ids_np]
+                    out['item_emb'][fid] = torch.from_numpy(arr)
+                else:
+                    out['item_emb'][fid] = torch.zeros((B, S, dim), dtype=torch.float32)
         return out
 
     def collate_fn(self, batch):
@@ -492,13 +637,23 @@ class MyDataset(torch.utils.data.Dataset):
         next_token_type = torch.from_numpy(np.stack(next_token_type)).long()
         next_action_type = torch.from_numpy(np.stack(next_action_type)).long()
 
-        # 时间戳建议用 float32
-        seq_ts = torch.from_numpy(np.stack(seq_ts)).float()
+        # 建议保持 int64，避免模型端再 .long()
+        seq_ts = torch.from_numpy(np.stack(seq_ts)).long()
 
-        # 将“字典数组”转为批内张量；item_emb 直接由 ids 索引生成
-        seq_feat = self._tensorize_feature_list(list(seq_feat), ids=seq.numpy(), token_type=token_type.numpy())
-        pos_feat = self._tensorize_feature_list(list(pos_feat), ids=pos.numpy())  # pos 仅在 next_type==1 时非 0
-        neg_feat = self._tensorize_feature_list(list(neg_feat), ids=neg.numpy())
+        # 向量化张量化：seq 需要 user+item+emb 全量，pos/neg 仅 item 侧
+        seq_feat = self._tensorize_feature_list(
+            list(seq_feat), ids=seq.numpy(), token_type=token_type.numpy(),
+            groups=['item_sparse', 'user_sparse', 'item_array', 'user_array',
+                    'item_continual', 'user_continual', 'item_emb']
+        )
+        pos_feat = self._tensorize_feature_list(
+            list(pos_feat), ids=pos.numpy(),
+            groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
+        )
+        neg_feat = self._tensorize_feature_list(
+            list(neg_feat), ids=neg.numpy(),
+            groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
+        )
 
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
 
@@ -555,7 +710,7 @@ class MyTestDataset(MyDataset):
         user_id = None
 
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, timestamp = record_tuple
+            u, i, user_feat, item_feat, action, timestamp = record_tuple
 
             if u:
                 if isinstance(u, str):  # 字符串：user_id
@@ -572,7 +727,10 @@ class MyTestDataset(MyDataset):
                 if i > self.itemnum:
                     i = 0
                 item_feat = self._process_cold_start_feat(item_feat) if item_feat else item_feat
-                item_tokens.append((i, item_feat, 1, timestamp))
+                # 动态加入历史动作特征 900（0=pad, 1=曝光, 2=点击）
+                feat_dict = dict(item_feat) if item_feat else {}
+                feat_dict['900'] = self._map_action_to_id(action)
+                item_tokens.append((i, feat_dict, 1, timestamp))
 
         ext_user_sequence = list(reversed(user_tokens)) + item_tokens
 
@@ -585,9 +743,9 @@ class MyTestDataset(MyDataset):
 
         idx = self.maxlen
 
-        # 从后向前填充到固定长度；与训练一致，丢弃最后一个元素作为“下一步”
+        # 从后向前填充到固定长度；在测试时不要丢弃下一步，因为测试集序列已经丢弃了下一步
         if ext_user_sequence:
-            for record_tuple in reversed(ext_user_sequence[:-1]):
+            for record_tuple in reversed(ext_user_sequence):
                 i, feat, type_, ts_cur = record_tuple
                 feat_filled = self._make_item_feat(i, feat) if type_ == 1 else self._make_user_feat(feat)
                 seq[idx] = i
@@ -723,6 +881,3 @@ def load_mm_emb(mm_path, feat_ids, indexer_i, itemnum):
 #         dicts[feat_id] = dct
 #         print(f'Loaded #{feat_id} mm_emb')
 #     return mats, dicts
-
-
-
