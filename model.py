@@ -252,27 +252,26 @@ class BaselineModel(torch.nn.Module):
         self.item_num = item_num
         self.dev = args.device
         self.maxlen = args.maxlen
-        # TODO: loss += args.l2_emb for regularizing embedding vectors during training
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.embedding_dim, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
         self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
 
-        # 新增：相对时间/位置偏置模块
-
+        # 相对时间/位置偏置
         self.rel_time_pos_bias = SeparatedRelativeTimeAndPositionBias(
-            max_seq_len=args.maxlen + 1,  # 数据集中 S = maxlen+1
+            max_seq_len=args.maxlen + 1,
             num_buckets=128,
             bucketization_fn=lambda x: (torch.log(torch.abs(x).clamp(min=1)) / 0.301).long()
         )
 
-        # 新增：绝对时间编码 + 周期特征嵌入（weekday / is_weekend / hour）
+        # 绝对时间编码（仍作为 add-on 特征加到序列表示上）
         self.time_abs_enc = FourierTimeEncoding(hidden_units=args.hidden_units)
-        # 周期特征嵌入（+1 预留0给padding）
-        self.hour_emb = torch.nn.Embedding(24 + 1, args.hidden_units, padding_idx=0)
-        self.dow_emb = torch.nn.Embedding(7 + 1, args.hidden_units, padding_idx=0)
+
+        # 将 hour/dow/weekend 作为“item 侧稀疏特征”输入到 user_item_dnn（注意：embedding_dim）
+        self.hour_emb = torch.nn.Embedding(24 + 1, args.embedding_dim, padding_idx=0)
+        self.dow_emb = torch.nn.Embedding(7 + 1, args.embedding_dim, padding_idx=0)
         # 1=工作日, 2=周末, 0=pad
-        self.weekend_emb = torch.nn.Embedding(2 + 1, args.hidden_units, padding_idx=0)
+        self.weekend_emb = torch.nn.Embedding(2 + 1, args.embedding_dim, padding_idx=0)
 
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
@@ -285,27 +284,36 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
+        # 计算两条路径的输入维度
         userdim = args.embedding_dim * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
         )
-        itemdim = (
-            args.embedding_dim * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
-            + len(self.ITEM_CONTINUAL_FEAT)
-            + args.embedding_dim * len(self.ITEM_EMB_FEAT)
+        itemdim_for_itemdnn = (
+                args.embedding_dim * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
+                + len(self.ITEM_CONTINUAL_FEAT)
+                + args.embedding_dim * len(self.ITEM_EMB_FEAT)
         )
-        all_dim = userdim + itemdim
+        # user_item 路径：在原有基础上 + hour/dow/weekend + 交叉特征
+        itemdim_for_user_itemdnn = itemdim_for_itemdnn + 3 * args.embedding_dim + args.embedding_dim * len(
+            self.ITEM_CROSS_FEAT)
+        all_dim_for_user_itemdnn = userdim + itemdim_for_user_itemdnn
 
-        self.user_item_dnn = FeatureInteractionEncoder(all_dim, args.hidden_units, args.dropout_rate)
-        self.item_dnn = FeatureInteractionEncoder(itemdim, args.hidden_units, args.dropout_rate)
+        # 两套编码器：user_item 使用包含时间特征与交叉特征的维度；item 使用原始维度（不含交叉特征）
+        self.user_item_dnn = FeatureInteractionEncoder(all_dim_for_user_itemdnn, args.hidden_units, args.dropout_rate)
+        self.item_dnn = FeatureInteractionEncoder(itemdim_for_itemdnn, args.hidden_units, args.dropout_rate)
 
         for _ in range(args.num_blocks):
             new_attn_layer = HSTU(args.hidden_units, args.num_heads, args.dropout_rate)
             self.attention_layers.append(new_attn_layer)
 
+        # ... embedding 表创建（增加 ITEM_CROSS_FEAT）
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.embedding_dim, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_SPARSE_FEAT[k] + 1, args.embedding_dim, padding_idx=0)
+        # 新增：交叉特征的 embedding 表
+        for k in self.ITEM_CROSS_FEAT:
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_CROSS_FEAT[k] + 1, args.embedding_dim, padding_idx=0)
         for k in self.ITEM_ARRAY_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_ARRAY_FEAT[k] + 1, args.embedding_dim, padding_idx=0)
         for k in self.USER_ARRAY_FEAT:
@@ -319,30 +327,41 @@ class BaselineModel(torch.nn.Module):
         """
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
         self.USER_CONTINUAL_FEAT = feat_types['user_continual']
-        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
+
+        # 新增：单独记录交叉特征（若数据侧未提供，回退为空）
+        cross_keys = feat_types.get('item_cross', [])
+        self.ITEM_CROSS_FEAT = {k: feat_statistics[k] for k in cross_keys}
+
+        # 普通 item 稀疏特征：从 item_sparse 中排除交叉特征
+        self.ITEM_SPARSE_FEAT = {
+            k: feat_statistics[k]
+            for k in feat_types['item_sparse']
+            if k not in self.ITEM_CROSS_FEAT
+        }
+
         self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']
         self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
         self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
 
-    def feat2emb(self, seq, feature_batch, mask=None, include_user=False):
+    def feat2emb(self, seq, feature_batch, mask=None, include_user=False, seq_ts=None):
         """
         Args:
-            seq: 序列ID [B,S]
-            feature_batch: 预张量化的特征字典（由 Dataset.collate_fn 生成）
-            mask: 掩码，1表示item，2表示user
-            include_user: 是否处理用户特征
-
+            seq: [B,S]
+            feature_batch: Dataset.collate_fn 预张量化特征
+            mask: [B,S]（1=item, 2=user, 0=pad）
+            include_user: 是否处理用户特征（user_item 路径）
+            seq_ts: [B,S] 绝对时间戳（秒）；仅在 include_user=True 时用于构造 item 时间离散特征
         Returns:
-            seqs_emb: [B, S, H]
+            seqs_emb: [B, S, H]（经对应的 DNN 编码后）
         """
-        seq = seq.to(self.dev)
+        seq = seq.to(self.dev, non_blocking=True)
 
         # 初始化 item/user id embedding
         if include_user:
-            user_mask = (mask == 2).to(self.dev)
-            item_mask = (mask == 1).to(self.dev)
+            user_mask = (mask == 2).to(self.dev, non_blocking=True)
+            item_mask = (mask == 1).to(self.dev, non_blocking=True)
             user_embedding = self.user_emb(user_mask * seq)
             item_embedding = self.item_emb(item_mask * seq)
             item_feat_list = [item_embedding]
@@ -351,35 +370,54 @@ class BaselineModel(torch.nn.Module):
             item_embedding = self.item_emb(seq)
             item_feat_list = [item_embedding]
 
-        # 直接消费预张量化特征（CPU->GPU 一次性拷贝，避免 Python 循环）
-        ft = feature_batch  # dict
+        ft = feature_batch  # 预张量化特征
 
-        # item 特征
+        # item 特征（不含时间离散特征）
+        # 仅保留普通 item 稀疏特征；交叉特征只在 user_item 路径启用
         for k, tens in ft.get('item_sparse', {}).items():
-            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
+            if (k in self.ITEM_SPARSE_FEAT) or (include_user and (k in self.ITEM_CROSS_FEAT)):
+                item_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)))
         for k, tens in ft.get('item_array', {}).items():
-            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
+            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)).sum(2))
         for k, tens in ft.get('item_continual', {}).items():
-            item_feat_list.append(tens.to(self.dev).unsqueeze(2))
+            item_feat_list.append(tens.to(self.dev, non_blocking=True).unsqueeze(2))
         for k in self.ITEM_EMB_FEAT:
             if k in ft.get('item_emb', {}):
-                t = ft['item_emb'][k].to(self.dev)
+                t = ft['item_emb'][k].to(self.dev, non_blocking=True)
                 item_feat_list.append(self.emb_transform[k](t))
+
+        # 将 hour / dow / weekend 作为“item 侧稀疏特征”拼到 user_item 路径
+        if include_user and (seq_ts is not None):
+            ts = seq_ts.to(self.dev, non_blocking=True).long()  # [B,S]
+            is_item = (mask == 1).to(self.dev, non_blocking=True) if mask is not None else torch.ones_like(ts, dtype=torch.bool)
+
+            hour_idx = ((ts % 86400) // 3600) + 1          # 1..24
+            dow_idx = (((ts // 86400) + 4) % 7) + 1        # 1..7
+            weekend_idx = (dow_idx >= 6).long() + 1        # 1=工作日, 2=周末
+
+            # 仅在 item 位置保留索引，其余位置置 0（embedding 的 padding_idx=0）
+            hour_idx     = torch.where(is_item, hour_idx, torch.zeros_like(hour_idx))
+            dow_idx      = torch.where(is_item,  dow_idx,  torch.zeros_like(dow_idx))
+            weekend_idx  = torch.where(is_item,  weekend_idx, torch.zeros_like(weekend_idx))
+
+            item_feat_list.append(self.hour_emb(hour_idx))
+            item_feat_list.append(self.dow_emb(dow_idx))
+            item_feat_list.append(self.weekend_emb(weekend_idx))
 
         # user 特征（仅在 include_user=True 时使用）
         if include_user:
             for k, tens in ft.get('user_sparse', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
+                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)))
             for k, tens in ft.get('user_array', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
+                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)).sum(2))
             for k, tens in ft.get('user_continual', {}).items():
-                user_feat_list.append(tens.to(self.dev).unsqueeze(2))
+                user_feat_list.append(tens.to(self.dev, non_blocking=True).unsqueeze(2))
 
         if include_user:
-            all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # [B, S, D]
+            all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # [B,S,D_user_item]
             seqs_emb = self.user_item_dnn(all_user_item_emb)
         else:
-            all_item_emb = torch.concat(item_feat_list, dim=-1)
+            all_item_emb = torch.concat(item_feat_list, dim=-1)                        # [B,S,D_item]
             seqs_emb = self.item_dnn(all_item_emb)
 
         return seqs_emb
@@ -390,50 +428,40 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
-        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
+
+        # 加入 seq_ts，使 hour/dow/weekend 作为 item 特征进入 user_item_dnn
+        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, seq_ts=seq_ts)
         seqs *= self.item_emb.embedding_dim ** 0.5
+
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= (log_seqs != 0)
         seqs += self.pos_emb(poss)
 
-        # =========== 绝对时间编码 + 三个周期特征 ===========
-        ts = seq_ts.to(self.dev).long()  # [B,S] 绝对时间戳（秒）
-        valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S] True=有效token
-
-        # 周期时间特征：hour(1..24), dow(1..7, ISO: 周一=1), is_weekend(1=工作日, 2=周末)
-        hour = ((ts % 86400) // 3600) + 1  # 1..24
-        dow = (((ts // 86400) + 4) % 7) + 1  # 1..7（1970-01-01是周四(+4)）
-        weekend_flag = (dow >= 6).long() + 1  # 1=工作日, 2=周末
-
-        # padding 置 0（embedding 的 padding_idx=0）
-        hour = torch.where(valid, hour, torch.zeros_like(hour))
-        dow = torch.where(valid, dow, torch.zeros_like(dow))
-        weekend = torch.where(valid, weekend_flag, torch.zeros_like(weekend_flag))
-
-        # 绝对时间傅里叶编码（零出 padding 位置）
-        time_abs = self.time_abs_enc(ts)  # [B,S,H]
-        time_abs = time_abs * valid.unsqueeze(-1)
-        seqs += self.hour_emb(hour) + self.dow_emb(dow) + self.weekend_emb(weekend) + time_abs
+        # 仅保留绝对时间傅里叶特征作为加性偏置（padding 位置为 0）
+        ts = seq_ts.to(self.dev, non_blocking=True).long()                         # [B,S]
+        valid = (mask != 0).to(torch.bool).to(self.dev, non_blocking=True)         # [B,S]
+        time_abs = self.time_abs_enc(ts) * valid.unsqueeze(-1)  # [B,S,H]
+        seqs += time_abs
 
         seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
         attention_mask_tril = torch.tril(ones_matrix)  # [S,S]
-        key_query_valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S]
-        # 同时屏蔽 pad 的 query 行与 key 列，并保留下三角
+        key_query_valid = (mask != 0).to(torch.bool).to(self.dev, non_blocking=True)  # [B,S]
         attention_mask = (
             attention_mask_tril.unsqueeze(0)
             & key_query_valid.unsqueeze(2)
             & key_query_valid.unsqueeze(1)
         )  # [B,S,S]
 
-        # =========== 相对时间偏置（正确的 pairwise t_i - t_j） ===========
-        # rel_ts_bias: [B,S,S]
+        # 相对时间/位置偏置
         rel_pos_bias, rel_ts_bias = self.rel_time_pos_bias(ts, key_query_valid)
 
         for i in range(len(self.attention_layers)):
-            seqs = self.attention_layers[i](seqs, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias)
+            seqs = self.attention_layers[i](
+                seqs, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias
+            )
         log_feats = F.normalize(seqs, dim=-1)
         return log_feats
 

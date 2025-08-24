@@ -44,6 +44,8 @@ def get_args():
 
     parser.add_argument('--temperature', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
+    parser.add_argument('--feature_crosses', nargs='*', default=["118+120"],
+                        help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -164,12 +166,12 @@ def evaluate_acc1(model, valid_loader, device, temperature=0.05):
         (seq, pos, neg, token_type, next_token_type, next_action_type,
          seq_feat, pos_feat, neg_feat, seq_ts) = batch
 
-        seq = seq.to(device)
-        pos = pos.to(device)
-        neg = neg.to(device)
-        token_type = token_type.to(device)
-        next_token_type = next_token_type.to(device)
-        next_action_type = next_action_type.to(device)
+        seq = seq.to(device, non_blocking=True)
+        pos = pos.to(device, non_blocking=True)
+        neg = neg.to(device, non_blocking=True)
+        token_type = token_type.to(device, non_blocking=True)
+        next_token_type = next_token_type.to(device, non_blocking=True)
+        next_action_type = next_action_type.to(device, non_blocking=True)
 
         pos_embs, neg_embs, log_feats = model(
             seq, pos, neg, token_type, next_token_type, next_action_type,
@@ -222,7 +224,7 @@ if __name__ == '__main__':
     split_gen = torch.Generator().manual_seed(args.seed)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [n_train, n_valid], generator=split_gen)
 
-    # 在训练开始前，导出 item 点击分桶映射供推理使用（方案A）
+    # 在训练开始前，导出 item 点击分桶映射供推理使用
     try:
         bucket = {}
         for iid in range(1, dataset.itemnum + 1):
@@ -319,12 +321,12 @@ if __name__ == '__main__':
             for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
                 device = args.device
-                seq = seq.to(device)
-                pos = pos.to(device)
-                neg = neg.to(device)
-                token_type = token_type.to(device)
-                next_token_type = next_token_type.to(device)
-                next_action_type = next_action_type.to(device)
+                seq = seq.to(device, non_blocking=True)
+                pos = pos.to(device, non_blocking=True)
+                neg = neg.to(device, non_blocking=True)
+                token_type = token_type.to(device, non_blocking=True)
+                next_token_type = next_token_type.to(device, non_blocking=True)
+                next_action_type = next_action_type.to(device, non_blocking=True)
 
                 pos_embs, neg_embs, log_feats = model(
                     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
@@ -360,12 +362,12 @@ if __name__ == '__main__':
                 for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader)):
                     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
                     device = args.device
-                    seq = seq.to(device)
-                    pos = pos.to(device)
-                    neg = neg.to(device)
-                    token_type = token_type.to(device)
-                    next_token_type = next_token_type.to(device)
-                    next_action_type = next_action_type.to(device)
+                    seq = seq.to(device, non_blocking=True)
+                    pos = pos.to(device, non_blocking=True)
+                    neg = neg.to(device, non_blocking=True)
+                    token_type = token_type.to(device, non_blocking=True)
+                    next_token_type = next_token_type.to(device, non_blocking=True)
+                    next_action_type = next_action_type.to(device, non_blocking=True)
 
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts

@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import MyTestDataset, save_emb
+from dataset import MyTestDataset, save_emb   # 注意：引用本回答的 datasetv2.py
 from model import BaselineModel
 
 
@@ -27,7 +27,7 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
@@ -58,6 +58,10 @@ def get_args():
 
     # DataLoader workers（推理）
     parser.add_argument('--num_workers', default=8, type=int)
+
+    # 可选：直接在推理端声明组合（若未能读取到清单文件时作为兜底）
+    parser.add_argument('--feature_crosses', nargs='*', default=["118+120"],
+                        help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
 
     args = parser.parse_args()
     return args
@@ -114,6 +118,86 @@ def _load_click_bucket_map_for_infer() -> Dict[int, int]:
     return {}
 
 
+# ======================== 泛化的特征组合（推理侧加载） ========================
+
+def _search_paths_for_infer():
+    paths = []
+    for k in ["USER_CACHE_PATH", "EVAL_RESULT_PATH", "MODEL_OUTPUT_PATH", "TRAIN_CKPT_PATH", "EVAL_DATA_PATH"]:
+        v = os.environ.get(k, None)
+        if v:
+            paths.append(Path(v))
+    return paths
+
+def _load_json_from_paths_infer(filename: str):
+    for root in _search_paths_for_infer():
+        p = root / filename
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f), p
+        except Exception as e:
+            print(f"warn: failed loading {filename} from {p}: {e}")
+    return None, None
+
+def _cross_key_from_fields(fields: List[str]) -> str:
+    fields = [str(f) for f in fields]
+    return "x" + "_".join(fields)
+
+def _parse_cross_specs_for_infer(args) -> List[Dict]:
+    # 显式配置优先；未配置则禁用
+    raw = getattr(args, "feature_crosses", None)
+    if raw is None:
+        raw = os.environ.get("FEATURE_CROSSES", None)
+
+    # None/空字符串/空列表 => 禁用
+    if raw is None or raw == "" or (isinstance(raw, (list, tuple)) and len(raw) == 0):
+        print("[feature crosses] infer: disabled (feature_crosses is None/empty)")
+        return []
+
+    if isinstance(raw, str):
+        items = [s for s in raw.strip().split() if s]
+    else:
+        items = list(raw)
+
+    specs = []
+    for s in items:
+        s = s.strip().replace(",", "+")
+        fields = [t for t in s.split("+") if t]
+        if len(fields) >= 2:
+            fields = sorted([str(f) for f in fields], key=lambda x: int(x) if x.isdigit() else x)
+            specs.append({"fields": fields, "key": _cross_key_from_fields(fields)})
+
+    # 去重
+    uniq = {}
+    for sp in specs:
+        uniq[sp["key"]] = sp
+    return list(uniq.values())
+
+def _load_cross_maps_for_infer(args):
+    """
+    返回：
+      - cross_specs: list[{'fields': [...], 'key': 'x...'}]
+      - cross_maps: dict[key -> dict['v1_v2_...' -> id]]
+    """
+    specs = _parse_cross_specs_for_infer(args)
+    maps = {}
+    for sp in specs:
+        key = sp['key']
+        fname = f"item_cross_{key}_map.json"
+        data, p = _load_json_from_paths_infer(fname)
+        if data is not None:
+            maps[key] = {str(k): int(v) for k, v in data.items()}
+            sp['size'] = max(1, len(maps[key]))
+            print(f"Loaded cross map {key} from {p}")
+        else:
+            maps[key] = {}
+            sp['size'] = 0
+            print(f"warn: cross map {key} not found. Will set its value to 0.")
+    return specs, maps
+
+# ==========================================================
+
+
 def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
     """
     生产候选库item的id和embedding，并落盘 embedding.fbin / id.u64bin
@@ -126,8 +210,23 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
     item_ids, creative_ids, retrieval_ids, features = [], [], [], []
     retrieve_id2creative_id = {}
 
-    # 载入点击桶映射（可为空）
+    # 载入点击桶映射
     click_bucket_map = _load_click_bucket_map_for_infer()
+    # 载入特征组合映射
+    # 这里不直接调用 _load_cross_maps_for_infer(args) 因为 get_candidate_emb 没有 args，
+    # 我们从环境变量推断或读取清单文件（复用上面的工具）
+    class _Dummy: pass
+    _d = _Dummy()
+    setattr(_d, "feature_crosses", os.environ.get("FEATURE_CROSSES", None))
+    cross_specs, cross_maps = _load_cross_maps_for_infer(_d)
+
+    def _to_int_safe(v):
+        if type(v) == list:
+            return int(v[0]) if len(v) > 0 else 0
+        try:
+            return int(v)
+        except Exception:
+            return 0
 
     with open(candidate_path, 'r') as f:
         for line in f:
@@ -149,11 +248,29 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
                 else:
                     feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
 
-            # 新增：点击次数分桶（901）。若不在统计文件中，回退 0。
+            # 点击次数分桶（901）
             try:
                 feature['901'] = int(click_bucket_map.get(int(item_id), 0))
             except Exception:
                 feature['901'] = 0
+
+            # 泛化：填充所有组合特征
+            for sp in cross_specs:
+                key = sp['key']
+                fields = sp['fields']
+                vals = []
+                ok = True
+                for fid in fields:
+                    v = _to_int_safe(feature.get(fid, 0))
+                    if v <= 0:
+                        ok = False
+                        break
+                    vals.append(v)
+                if ok:
+                    tkey = "_".join(str(x) for x in vals)
+                    feature[key] = int(cross_maps.get(key, {}).get(tkey, 0))
+                else:
+                    feature[key] = 0
 
             item_ids.append(item_id)
             creative_ids.append(creative_id)
@@ -193,52 +310,41 @@ def batched_topk_torch(
     纯 PyTorch 分块 Top-K 检索：
     - 双分块（查询/库）避免显存爆炸
     - 对每个查询批，跨库分块维护运行中 top-k（二次 topk 合并）
-
-    Returns:
-        topk_indices: LongTensor [Q, top_k]，为 items 的下标（0..I-1）
     """
     Q, D = queries.shape
     I, D2 = items.shape
     assert D == D2, f"Dim mismatch: {D} vs {D2}"
 
-    # 设备/精度
     on_cuda = (device.type == 'cuda')
     if on_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
     dtype = torch.float16 if (use_fp16 and on_cuda) else torch.float32
 
-    # 预分配输出
     out_indices = torch.empty((Q, top_k), dtype=torch.long)
 
-    # 为了减少拷贝，items 按块搬到 device
     for q_start in tqdm(range(0, Q, query_bs), desc='ANN(query-chunks)'):
         q_end = min(q_start + query_bs, Q)
-        q_chunk = queries[q_start:q_end].to(device=device, dtype=dtype, non_blocking=True)  # [qb, D]
+        q_chunk = queries[q_start:q_end].to(device=device, dtype=dtype, non_blocking=True)
         qb = q_chunk.shape[0]
 
-        # 当前查询块的全局 top-k（逐库块更新）
         best_scores = torch.full((qb, top_k), -1e9, device=device, dtype=torch.float32)
         best_indices = torch.full((qb, top_k), -1, device=device, dtype=torch.long)
 
         for i_start in range(0, I, item_bs):
             i_end = min(i_start + item_bs, I)
-            item_block = items[i_start:i_end].to(device=device, dtype=dtype, non_blocking=True)  # [ib, D]
-            ib = item_block.shape[0]
+            item_block = items[i_start:i_end].to(device=device, dtype=dtype, non_blocking=True)
 
-            # 相似度（已归一化 -> 余弦 == 点积）
-            sims = torch.matmul(q_chunk, item_block.t())  # [qb, ib]
-            sims32 = sims.float()  # 合并与存储都用 fp32，稳定一些
+            sims = torch.matmul(q_chunk, item_block.t())
+            sims32 = sims.float()
 
-            # 库块内 top-k（若 ib < top_k，取 ib）
-            k_local = min(top_k, ib)
-            block_scores, block_pos = torch.topk(sims32, k=k_local, dim=1)        # [qb, k_local]
-            block_indices = (block_pos + i_start)                                  # [qb, k_local]
+            k_local = min(top_k, item_block.shape[0])
+            block_scores, block_pos = torch.topk(sims32, k=k_local, dim=1)
+            block_indices = (block_pos + i_start)
 
-            # 合并当前 best 与 block top-k -> 再取 top-k
-            comb_scores = torch.cat([best_scores, block_scores], dim=1)            # [qb, 2k]
-            comb_indices = torch.cat([best_indices, block_indices], dim=1)         # [qb, 2k]
-            best_scores, sel = torch.topk(comb_scores, k=top_k, dim=1)             # [qb, k], [qb, k]
-            best_indices = torch.gather(comb_indices, 1, sel)                      # [qb, k]
+            comb_scores = torch.cat([best_scores, block_scores], dim=1)
+            comb_indices = torch.cat([best_indices, block_indices], dim=1)
+            best_scores, sel = torch.topk(comb_scores, k=top_k, dim=1)
+            best_indices = torch.gather(comb_indices, 1, sel)
 
             del sims, sims32, block_scores, block_pos, block_indices, comb_scores, comb_indices, sel
             if on_cuda:
@@ -250,7 +356,7 @@ def batched_topk_torch(
         if on_cuda:
             torch.cuda.empty_cache()
 
-    return out_indices  # [Q, top_k]
+    return out_indices
 
 
 def infer():
@@ -290,15 +396,12 @@ def infer():
     for step, batch in tqdm(enumerate(test_loader), total=len(test_loader), desc='Encoding queries'):
         seq, token_type, seq_feat, user_id, seq_ts = batch
         seq = seq.to(device, non_blocking=True)
-        # 注意：若采用“预张量化特征字典”的 Dataset 版本，seq_feat 内部张量需要按需搬到 GPU，
-        # 模型内部会调用 .to(self.dev) 统一处理；此处保持原封不动地传入。
         with torch.no_grad():
             emb = model.predict(seq, seq_feat, token_type, seq_ts)  # [B, D]，已归一化
         all_embs.append(emb.detach().cpu().numpy().astype(np.float32))
         user_list += user_id
 
     all_embs = np.concatenate(all_embs, axis=0)  # [Q, D]
-    # 可选：保存 query 文件（兼容旧流程/调试用）
     save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
 
     # 生成候选库的embedding 以及 id文件（embedding.fbin / id.u64bin）
@@ -318,8 +421,8 @@ def infer():
     assert item_embs.shape[0] == item_ids_u64.shape[0], "embedding 与 id 数量不一致"
 
     # 转为 torch，准备检索
-    queries_t = torch.from_numpy(all_embs)        # [Q, D] 已归一化
-    items_t = torch.from_numpy(item_embs)         # [I, D] 已归一化
+    queries_t = torch.from_numpy(all_embs)        # [Q, D]
+    items_t = torch.from_numpy(item_embs)         # [I, D]
 
     # 分块 Top-K
     topk_idx = batched_topk_torch(
@@ -330,7 +433,7 @@ def infer():
         query_bs=args.torch_query_bs,
         item_bs=args.torch_item_bs,
         use_fp16=args.use_fp16,
-    )  # [Q, top_k] 索引（对齐 item_embs / item_ids_u64）
+    )
 
     # 映射为检索ID -> creative_id
     top10s: List[List[int]] = []
