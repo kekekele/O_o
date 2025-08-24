@@ -26,7 +26,7 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
@@ -250,7 +250,7 @@ if __name__ == '__main__':
         print(f'warn: failed to dump item_click_bucket.json: {e}')
 
     # DataLoader
-    num_workers = 8
+    num_workers = 12
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -259,7 +259,7 @@ if __name__ == '__main__':
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=6
+        prefetch_factor=4
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -269,14 +269,13 @@ if __name__ == '__main__':
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=6
+        prefetch_factor=4
     )
 
     # 模型
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
-    model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     # 模块初始化
     model.apply(init_weights)

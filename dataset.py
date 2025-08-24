@@ -96,7 +96,7 @@ class MyDataset(torch.utils.data.Dataset):
         # 为快速特征填充准备“全量模板”和简单缓存（每个 worker 独立）
         self._build_feat_templates()
         self._item_feat_cache = OrderedDict()
-        self._item_feat_cache_max = 100000  # 可根据内存调节，如 20000/100000
+        self._item_feat_cache_max = 400000  # 可根据内存调节，如 20000/100000
 
     def _load_data_and_offsets(self):
         """
@@ -469,6 +469,8 @@ class MyDataset(torch.utils.data.Dataset):
         """
         向量化张量化：将批内“字典数组”转为稠密张量。
         groups: 只构建需要的组，缺省构建全部。
+        ids: 与位置对齐的 ID（例如 seq/pos/neg），用于查表 item_emb
+        token_type: 与位置对齐的 token 类型（1=item, 2=user），用于在 seq 的用户位置屏蔽 item_emb
         """
         if groups is None:
             groups = ['item_sparse', 'user_sparse', 'item_array', 'user_array',
@@ -488,18 +490,13 @@ class MyDataset(torch.utils.data.Dataset):
         }
         ft = self.feature_types
 
-        # 将 feat_list 拍平成 2D 访问视图以减少 Python 循环开销
-        # flat_feat[b, s] -> dict
-        # 仍然保留两层循环，但字段内不再循环每个位置
         # 1) sparse
         if 'item_sparse' in groups:
             for fid in ft['item_sparse']:
                 arr = np.zeros((B, S), dtype=np.int64)
                 for b in range(B):
                     row = feat_list[b]
-                    # 向量化读取：把这一行所有 s 的 fid 值拉出来
                     vals = [row[s].get(fid, 0) for s in range(S)]
-                    # 处理 list -> 取首元素；非数值 -> 0
                     v = np.fromiter(
                         (int(v[0] if isinstance(v, list) and len(v) > 0 else (0 if isinstance(v, list) else int(v)))
                          for v in vals),
@@ -522,19 +519,16 @@ class MyDataset(torch.utils.data.Dataset):
                     arr[b] = v
                 out['user_sparse'][fid] = torch.from_numpy(arr)
 
-        # 2) array：两遍扫描 -> 先求 max_len，再一次性填充
+        # 2) array
         if 'item_array' in groups:
             for fid in ft['item_array']:
-                # 求 max_len
                 max_len = 1
                 for b in range(B):
                     row = feat_list[b]
-                    # 拉平这一行的长度
                     for s in range(S):
                         v = row[s].get(fid, [0])
-                        if isinstance(v, list):
-                            if len(v) > max_len:
-                                max_len = len(v)
+                        if isinstance(v, list) and len(v) > max_len:
+                            max_len = len(v)
                 arr = np.zeros((B, S, max_len), dtype=np.int64)
                 for b in range(B):
                     row = feat_list[b]
@@ -555,9 +549,8 @@ class MyDataset(torch.utils.data.Dataset):
                     row = feat_list[b]
                     for s in range(S):
                         v = row[s].get(fid, [0])
-                        if isinstance(v, list):
-                            if len(v) > max_len:
-                                max_len = len(v)
+                        if isinstance(v, list) and len(v) > max_len:
+                            max_len = len(v)
                 arr = np.zeros((B, S, max_len), dtype=np.int64)
                 for b in range(B):
                     row = feat_list[b]
@@ -571,7 +564,7 @@ class MyDataset(torch.utils.data.Dataset):
                             arr[b, s, 0] = int(v)
                 out['user_array'][fid] = torch.from_numpy(arr)
 
-        # 3) continual：一次性 fromiter 转换 float32
+        # 3) continual
         if 'item_continual' in groups:
             for fid in ft['item_continual']:
                 arr = np.zeros((B, S), dtype=np.float32)
@@ -598,16 +591,27 @@ class MyDataset(torch.utils.data.Dataset):
                     arr[b] = v
                 out['user_continual'][fid] = torch.from_numpy(arr)
 
+        # 4) item_emb（修复：在非 item 位置屏蔽为 0；并做越界保护）
         if 'item_emb' in groups:
             for fid in self.feature_types['item_emb']:
                 dim = int(self.feature_default_value[fid].shape[0])
                 if ids is not None:
                     ids_np = np.asarray(ids, dtype=np.int64)  # [B,S]
-                    mat = self.mm_emb_mats[fid]  # [itemnum+1, dim] (float32)
-                    arr = mat[ids_np]
+                    # 在用户位置（token_type != 1）置 0 行（padding）
+                    if token_type is not None:
+                        tt = np.asarray(token_type, dtype=np.int64)
+                        ids_masked = ids_np.copy()
+                        ids_masked[tt != 1] = 0
+                    else:
+                        ids_masked = ids_np
+                    # 越界保护：非法 id -> 0
+                    ids_masked = np.where((ids_masked >= 0) & (ids_masked <= self.itemnum), ids_masked, 0)
+                    mat = self.mm_emb_mats[fid]  # [itemnum+1, dim]
+                    arr = mat[ids_masked]  # [B,S,dim]
                     out['item_emb'][fid] = torch.from_numpy(arr)
                 else:
                     out['item_emb'][fid] = torch.zeros((B, S, dim), dtype=torch.float32)
+
         return out
 
     def collate_fn(self, batch):
@@ -625,35 +629,43 @@ class MyDataset(torch.utils.data.Dataset):
             seq_feat: 预张量化的用户序列特征字典
             pos_feat: 预张量化的正样本特征字典
             neg_feat: 预张量化的负样本特征字典
-            seq_ts: 与 seq 对齐的时间戳, torch.FloatTensor [B, S]
+            seq_ts: 与 seq 对齐的时间戳, torch.LongTensor [B, S]
         """
         (seq, pos, neg, token_type, next_token_type, next_action_type,
          seq_feat, pos_feat, neg_feat, seq_ts) = zip(*batch)
 
-        seq = torch.from_numpy(np.stack(seq)).long()
-        pos = torch.from_numpy(np.stack(pos)).long()
-        neg = torch.from_numpy(np.stack(neg)).long()
-        token_type = torch.from_numpy(np.stack(token_type)).long()
-        next_token_type = torch.from_numpy(np.stack(next_token_type)).long()
-        next_action_type = torch.from_numpy(np.stack(next_action_type)).long()
+        # 先全部保持在 NumPy
+        seq_np = np.stack(seq)
+        pos_np = np.stack(pos)
+        neg_np = np.stack(neg)
+        tt_np = np.stack(token_type)
+        ntt_np = np.stack(next_token_type)
+        nat_np = np.stack(next_action_type)
+        ts_np = np.stack(seq_ts)
 
-        # 建议保持 int64，避免模型端再 .long()
-        seq_ts = torch.from_numpy(np.stack(seq_ts)).long()
-
-        # 向量化张量化：seq 需要 user+item+emb 全量，pos/neg 仅 item 侧
+        # 向量化：直接传 NumPy，避免 tensor.numpy() 往返
         seq_feat = self._tensorize_feature_list(
-            list(seq_feat), ids=seq.numpy(), token_type=token_type.numpy(),
+            list(seq_feat), ids=seq_np, token_type=tt_np,
             groups=['item_sparse', 'user_sparse', 'item_array', 'user_array',
                     'item_continual', 'user_continual', 'item_emb']
         )
         pos_feat = self._tensorize_feature_list(
-            list(pos_feat), ids=pos.numpy(),
+            list(pos_feat), ids=pos_np,
             groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
         )
         neg_feat = self._tensorize_feature_list(
-            list(neg_feat), ids=neg.numpy(),
+            list(neg_feat), ids=neg_np,
             groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
         )
+
+        # 再一次性转成 Torch
+        seq = torch.from_numpy(seq_np).long()
+        pos = torch.from_numpy(pos_np).long()
+        neg = torch.from_numpy(neg_np).long()
+        token_type = torch.from_numpy(tt_np).long()
+        next_token_type = torch.from_numpy(ntt_np).long()
+        next_action_type = torch.from_numpy(nat_np).long()
+        seq_ts = torch.from_numpy(ts_np).long()
 
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
 
@@ -774,12 +786,12 @@ class MyTestDataset(MyDataset):
             token_type: torch.LongTensor [B, S]
             seq_feat: 预张量化的特征字典
             user_id: tuple(str)，长度 B
-            seq_ts: torch.FloatTensor [B, S]
+            seq_ts: torch.LongTensor [B, S]
         """
         seq, token_type, seq_feat, user_id, seq_ts = zip(*batch)
         seq = torch.from_numpy(np.stack(seq)).long()
         token_type = torch.from_numpy(np.stack(token_type)).long()
-        seq_ts = torch.from_numpy(np.stack(seq_ts)).float()
+        seq_ts = torch.from_numpy(np.stack(seq_ts)).long()
 
         # 将“字典数组”转为批内张量
         seq_feat = self._tensorize_feature_list(list(seq_feat), ids=seq.numpy(), token_type=token_type.numpy())
@@ -840,11 +852,11 @@ def load_mm_emb(mm_path, feat_ids, indexer_i, itemnum):
                 reid = indexer_i.get(raw_id, None)
                 if reid is not None and 0 <= reid <= itemnum:
                     mat[reid] = vec
-
         mats[feat_id] = mat
         dicts[feat_id] = dct
         print(f'Loaded #{feat_id} mm_emb')
     return mats, dicts
+
 
 # def load_mm_emb(mm_path, feat_ids, indexer_i, itemnum):
 #     """

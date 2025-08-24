@@ -8,6 +8,73 @@ from tqdm import tqdm
 from dataset import save_emb
 
 
+class RelativeTimeBucketEmbedding(torch.nn.Module):
+    """
+    将相邻事件的时间差(秒)按“线性+对数”混合分桶，并用 Embedding 映射到隐藏向量。
+    索引0为padding/无效，不产生偏置；有效桶索引为 1..num_buckets。
+    """
+    def __init__(
+        self,
+        hidden_units: int,
+        num_buckets: int = 48,
+        unit_seconds: float = 60.0,            # 量化步长：每多少秒作为1单位（默认1分钟）
+        max_seconds: float = 40 * 86400.0      # 覆盖的最大时间差（默认40天）
+    ):
+        super().__init__()
+        assert num_buckets >= 2
+        assert unit_seconds > 0 and max_seconds > 0
+
+        self.hidden_units = hidden_units
+        self.num_buckets = num_buckets
+        self.unit_seconds = float(unit_seconds)
+        self.max_units = max(1.0, float(max_seconds) / self.unit_seconds)  # 以“单位”为尺度的最大跨度
+        self.max_exact = num_buckets // 2                                  # 前半部分线性桶
+
+        # +1 预留 idx=0 为 padding
+        self.emb = torch.nn.Embedding(num_buckets + 1, hidden_units, padding_idx=0)
+
+    @torch.no_grad()
+    def bucketize(self, dt_seconds: torch.Tensor) -> torch.Tensor:
+        """
+        将 Δt(秒) -> 桶索引（0..num_buckets；其中0为无效）
+        dt_seconds: [B,S] 或任意形状
+        """
+        # 先按 unit_seconds 量化到“单位”整数
+        units = torch.floor(dt_seconds.to(torch.float32) / self.unit_seconds)
+        units = torch.clamp(units, min=0.0, max=self.max_units).to(torch.int64)  # [..]
+
+        # 线性小桶：0..max_exact
+        small = units <= self.max_exact
+
+        # 对数大桶：max_exact+1..num_buckets-1
+        lower = float(self.max_exact + 1)
+        num_big = self.num_buckets - (self.max_exact + 1)  # 大桶数量
+        # 防止无大桶或除0
+        if num_big <= 0 or self.max_units <= lower:
+            log_idx = torch.full_like(units, self.num_buckets - 1)  # 退化为最后一个桶
+        else:
+            units_f = units.to(torch.float32).clamp(min=lower)
+            # 映射到 [0,1] 上，再缩放到大桶区间
+            denom = math.log(self.max_units / lower)
+            ratio = (torch.log(units_f / lower)) / max(1e-6, denom)
+            log_idx = (self.max_exact + 1) + torch.floor(ratio * (num_big - 1)).to(torch.int64)
+            log_idx = torch.clamp(log_idx, min=self.max_exact + 1, max=self.num_buckets - 1)
+
+        buckets = torch.where(small, units, log_idx)  # 0..num_buckets-1
+        buckets = torch.clamp(buckets, min=0, max=self.num_buckets - 1)
+        buckets = buckets + 1  # 1..num_buckets（0 预留给无效）
+        return buckets
+
+    def forward(self, dt_seconds: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """
+        dt_seconds: [B,S] 相邻事件时间差（秒）
+        valid_mask: [B,S] True 表示该位置有效且需要加偏置（通常需满足: 当前有效 且 前一位有效 且 dt>0）
+        return: [B,S,H]
+        """
+        bucket_ids = self.bucketize(dt_seconds)                    # [B,S], 1..num_buckets
+        bucket_ids = torch.where(valid_mask, bucket_ids, 0)        # 无效处 -> 0 (padding_idx)
+        return self.emb(bucket_ids)                                # [B,S,H]
+
 class FourierTimeEncoding(torch.nn.Module):
     """
     将绝对时间戳（秒）映射为多频正余弦，再线性投到隐藏维。
@@ -85,7 +152,6 @@ class HSTU(torch.nn.Module):
         attn_output = torch.matmul(attn_weights, V)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
         output = self.out_linear(torch.cat([U, attn_output, attn_output * U], dim=-1))
-        # output = F.dropout(output, p=self.dropout_rate, training=self.training)
         output = self.rms_norm(output + x)  # DeepNorm
         return output
 
@@ -159,6 +225,13 @@ class BaselineModel(torch.nn.Module):
         self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
         # 新增：绝对时间编码 + 周期特征嵌入（weekday / is_weekend / hour）
         self.time_abs_enc = FourierTimeEncoding(hidden_units=args.hidden_units)
+        # 新增：相对时间分桶嵌入（Embedding 表）
+        self.time_rel_bucket = RelativeTimeBucketEmbedding(
+            hidden_units=args.hidden_units,
+            num_buckets=getattr(args, "rel_num_buckets", 48),
+            unit_seconds=getattr(args, "rel_unit_seconds", 60.0),  # 以分钟为粒度
+            max_seconds=getattr(args, "rel_max_seconds", 40 * 86400.0),  # 覆盖到40天
+        )
         # 周期特征嵌入（+1 预留0给padding）
         self.hour_emb = torch.nn.Embedding(24 + 1, args.hidden_units, padding_idx=0)
         self.dow_emb = torch.nn.Embedding(7 + 1, args.hidden_units, padding_idx=0)
@@ -289,23 +362,33 @@ class BaselineModel(torch.nn.Module):
         seqs += self.pos_emb(poss)
 
         # =========== 绝对时间编码 + 三个周期特征 ===========
-        ts = seq_ts.to(self.dev, non_blocking=True)  # [B,S] 绝对时间戳（秒）
-        valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S] True=有效token
+        ts = seq_ts.to(self.dev, non_blocking=True)  # [B,S]
+        valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S]
 
-        # 周期时间特征：hour(1..24), dow(1..7, ISO: 周一=1), is_weekend(1=工作日, 2=周末)
-        hour = ((ts % 86400) // 3600) + 1  # 1..24
-        dow = (((ts // 86400) + 4) % 7) + 1  # 1..7（1970-01-01是周四(+4)）
-        weekend_flag = (dow >= 6).long() + 1  # 1=工作日, 2=周末
+        hour = ((ts % 86400) // 3600) + 1
+        dow = (((ts // 86400) + 4) % 7) + 1
+        weekend_flag = (dow >= 6).long() + 1
 
-        # padding 置 0（embedding 的 padding_idx=0）
         hour = torch.where(valid, hour, torch.zeros_like(hour))
         dow = torch.where(valid, dow, torch.zeros_like(dow))
         weekend = torch.where(valid, weekend_flag, torch.zeros_like(weekend_flag))
 
-        # 绝对时间傅里叶编码（零出 padding 位置）
         time_abs = self.time_abs_enc(ts)  # [B,S,H]
         time_abs = time_abs * valid.unsqueeze(-1)
+
         seqs += self.hour_emb(hour) + self.dow_emb(dow) + self.weekend_emb(weekend) + time_abs
+
+        # =========== 相对时间偏差（相邻 Δt 的分桶 Embedding） ===========
+        # 计算相邻时间差：首位或前一位无效，则不加偏置
+        ts_prev = torch.cat([ts[:, :1], ts[:, :-1]], dim=1)  # [B,S]
+        prev_valid = torch.cat([valid[:, :1], valid[:, :-1]], dim=1)  # [B,S]
+
+        dt_prev = torch.clamp(ts - ts_prev, min=0)  # [B,S] 负数截断为0
+        # 仅当 当前有效 且 前一位有效 且 dt>0 时才使用相对时间嵌入
+        rel_valid = valid & prev_valid & (dt_prev > 0)
+
+        time_rel = self.time_rel_bucket(dt_prev, rel_valid)  # [B,S,H]
+        seqs += time_rel
 
         seqs = self.emb_dropout(seqs)
 
