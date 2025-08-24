@@ -7,86 +7,78 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
-
-class RelativeTimeBucketEmbedding(torch.nn.Module):
+class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
     """
-    将相邻事件的时间差(秒)按“线性+对数”混合分桶，并用 Embedding 映射到隐藏向量。
-    索引0为padding/无效，不产生偏置；有效桶索引为 1..num_buckets。
+    生成两类 bias（logits）：
+      - rel_pos_bias: [1, S, S]，仅由相对位置决定（Toeplitz）
+      - rel_ts_bias:  [B, S, S]，由 t_i - t_j 的“时间桶”决定（仅在 i>=j 且两端有效时生效）
     """
-    def __init__(
-        self,
-        hidden_units: int,
-        num_buckets: int = 48,
-        unit_seconds: float = 60.0,            # 量化步长：每多少秒作为1单位（默认1分钟）
-        max_seconds: float = 40 * 86400.0      # 覆盖的最大时间差（默认40天）
-    ):
+    def __init__(self, max_seq_len: int, num_buckets: int, bucketization_fn):
         super().__init__()
-        assert num_buckets >= 2
-        assert unit_seconds > 0 and max_seconds > 0
-
-        self.hidden_units = hidden_units
+        self.max_seq_len = max_seq_len
         self.num_buckets = num_buckets
-        self.unit_seconds = float(unit_seconds)
-        self.max_units = max(1.0, float(max_seconds) / self.unit_seconds)  # 以“单位”为尺度的最大跨度
-        self.max_exact = num_buckets // 2                                  # 前半部分线性桶
+        self.bucketization_fn = bucketization_fn
+        # 可学习参数
+        self.ts_w = torch.nn.Parameter(torch.empty(num_buckets + 1).normal_(mean=0.0, std=0.02))
+        self.pos_w = torch.nn.Parameter(torch.empty(2 * max_seq_len - 1).normal_(mean=0.0, std=0.02))
+        # 将 padding 桶(0)的偏置初始化为 0，避免无效位产生无用偏置
+        with torch.no_grad():
+            self.ts_w[0].zero_()
 
-        # +1 预留 idx=0 为 padding
-        self.emb = torch.nn.Embedding(num_buckets + 1, hidden_units, padding_idx=0)
-
-    @torch.no_grad()
-    def bucketize(self, dt_seconds: torch.Tensor) -> torch.Tensor:
+    def forward(self, timestamps: torch.Tensor, valid_mask: torch.Tensor):
         """
-        将 Δt(秒) -> 桶索引（0..num_buckets；其中0为无效）
-        dt_seconds: [B,S] 或任意形状
+        timestamps: [B, S]（单位例如秒；浮点/整型均可）
+        valid_mask: [B, S]（True=有效 token；False=padding）
+        返回：
+          rel_pos_bias: [1, S, S]
+          rel_ts_bias:  [B, S, S]
         """
-        # 先按 unit_seconds 量化到“单位”整数
-        units = torch.floor(dt_seconds.to(torch.float32) / self.unit_seconds)
-        units = torch.clamp(units, min=0.0, max=self.max_units).to(torch.int64)  # [..]
+        B, S = timestamps.shape
 
-        # 线性小桶：0..max_exact
-        small = units <= self.max_exact
+        # 相对位置偏置（Toeplitz），支持 S <= max_seq_len；保持 [1,S,S] 以减少显存，通过广播加到 [B,S,S]
+        pos_vec = self.pos_w[: 2 * S - 1]  # 中心在 S-1
+        t = F.pad(pos_vec, [0, S]).repeat(S)
+        t = t[..., :-S].reshape(1, S, 3 * S - 2)
+        r = (2 * S - 1) // 2
+        rel_pos_bias = t[:, :, r:-r]  # [1, S, S]
 
-        # 对数大桶：max_exact+1..num_buckets-1
-        lower = float(self.max_exact + 1)
-        num_big = self.num_buckets - (self.max_exact + 1)  # 大桶数量
-        # 防止无大桶或除0
-        if num_big <= 0 or self.max_units <= lower:
-            log_idx = torch.full_like(units, self.num_buckets - 1)  # 退化为最后一个桶
-        else:
-            units_f = units.to(torch.float32).clamp(min=lower)
-            # 映射到 [0,1] 上，再缩放到大桶区间
-            denom = math.log(self.max_units / lower)
-            ratio = (torch.log(units_f / lower)) / max(1e-6, denom)
-            log_idx = (self.max_exact + 1) + torch.floor(ratio * (num_big - 1)).to(torch.int64)
-            log_idx = torch.clamp(log_idx, min=self.max_exact + 1, max=self.num_buckets - 1)
+        # 成对相对时间：t_i - t_j（因果：i >= j 时才有效；负数截断为 0）
+        ti = timestamps.unsqueeze(2)             # [B, S, 1]
+        tj = timestamps.unsqueeze(1)             # [B, 1, S]
+        deltas = torch.clamp(ti - tj, min=0)     # [B, S, S]
 
-        buckets = torch.where(small, units, log_idx)  # 0..num_buckets-1
-        buckets = torch.clamp(buckets, min=0, max=self.num_buckets - 1)
-        buckets = buckets + 1  # 1..num_buckets（0 预留给无效）
-        return buckets
+        # 时间差分桶
+        bucket_ids = self.bucketization_fn(deltas)  # [B, S, S]，范围 [0..num_buckets]（0=padding桶，num_buckets=溢出）
 
-    def forward(self, dt_seconds: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        """
-        dt_seconds: [B,S] 相邻事件时间差（秒）
-        valid_mask: [B,S] True 表示该位置有效且需要加偏置（通常需满足: 当前有效 且 前一位有效 且 dt>0）
-        return: [B,S,H]
-        """
-        bucket_ids = self.bucketize(dt_seconds)                    # [B,S], 1..num_buckets
-        bucket_ids = torch.where(valid_mask, bucket_ids, 0)        # 无效处 -> 0 (padding_idx)
-        return self.emb(bucket_ids)                                # [B,S,H]
+        # 构造有效对掩码：两端有效，且下三角（i>=j）
+        vi = valid_mask.unsqueeze(2)              # [B, S, 1]
+        vj = valid_mask.unsqueeze(1)              # [B, 1, S]
+        pair_valid = vi & vj                      # [B, S, S]
+        tril_mask = torch.tril(torch.ones(S, S, dtype=torch.bool, device=timestamps.device))
+        pair_valid = pair_valid & tril_mask       # 仅保留下三角
+
+        # 无效位置 -> 0（padding 桶）
+        diag = torch.eye(S, dtype=torch.bool, device=timestamps.device)
+        pair_valid = pair_valid & (~diag)  # 对角线视作无效对 -> 后续会被置为 0 号 padding 桶
+        bucket_ids = torch.where(pair_valid, bucket_ids, torch.zeros_like(bucket_ids))
+
+        # 将桶号映射为标量偏置
+        rel_ts_bias = self.ts_w[bucket_ids]       # [B, S, S]
+        return rel_pos_bias, rel_ts_bias
+
 
 class FourierTimeEncoding(torch.nn.Module):
     """
     将绝对时间戳（秒）映射为多频正余弦，再线性投到隐藏维。
-    特点：参数量小、可外推、对不同时间尺度（小时~月）建模友好。作为hour、weekday、is_weekday补充
+    特点：参数量小、可外推、对不同时间尺度（小时~月）建模友好。作为 hour、weekday、is_weekday 的补充
     """
 
     def __init__(
             self,
             hidden_units: int,
             num_frequencies: int = 8,
-            min_period_seconds: float = 8 * 86400.0,  # 最短周期：1小时=3600.0，使用8 * 86400.0以防止与hour、weekday、is_weekday重复
-            max_period_seconds: float = 40 * 86400.0,  # 最长周期 似乎数据集是40天内的
+            min_period_seconds: float = 8 * 86400.0,  # 最短周期：1小时=3600.0，使用 8*86400.0 以防止与 hour、weekday、is_weekday 重复
+            max_period_seconds: float = 40 * 86400.0, # 最长周期（数据集似乎 40 天内）
     ):
         super().__init__()
         assert num_frequencies >= 1
@@ -112,7 +104,7 @@ class FourierTimeEncoding(torch.nn.Module):
         s = torch.sin(angle)
         c = torch.cos(angle)
         feats = torch.cat([s, c], dim=-1)  # [B,S,2L]
-        out = self.proj(feats)  # [B,S,H]
+        out = self.proj(feats)             # [B,S,H]
         return out
 
 
@@ -128,30 +120,74 @@ class HSTU(torch.nn.Module):
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
         self.rms_norm = torch.nn.RMSNorm(hidden_units, eps=1e-8)
 
-        self.qkvu_linear = torch.nn.Sequential(torch.nn.Linear(hidden_units, hidden_units * 4),
-                                               torch.nn.SiLU())
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        # FIX: 输出维度改为 6H（U:3H, V:H, Q:H, K:H）
+        self.qkvu_linear = torch.nn.Sequential(
+            torch.nn.Linear(hidden_units, hidden_units * 6),
+            torch.nn.SiLU(),
+        )
+
         self.out_linear = torch.nn.Linear(hidden_units * 3, hidden_units)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, rel_pos_bias=None, rel_ts_bias=None):
+        """
+        x: [B,S,H]
+        attn_mask: [B,S,S]，True=允许；False=屏蔽
+        rel_pos_bias: [1,S,S] 或 [B,S,S]，相对位置偏置
+        rel_ts_bias:  [B,S,S]，相对时间偏置
+        """
         batch_size, seq_len, _ = x.size()
 
-        # 计算Q, K, V
-        Q, K, V, U = torch.chunk(self.qkvu_linear(x), dim=-1, chunks=4)
+        # 计算 U, V, Q, K
+        mm_output = self.qkvu_linear(x)  # [B,S,6H]
+        U, V, Q, K = torch.split(
+            mm_output,
+            [
+                self.hidden_units * 3,  # U
+                self.hidden_units,      # V
+                self.hidden_units,      # Q
+                self.hidden_units,      # K
+            ],
+            dim=-1,
+        )
 
-        # reshape为multi-head格式
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # reshape 为 multi-head 格式
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B,h,S,d]
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B,h,S,d]
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B,h,S,d]
 
-        attn_weights = F.relu(torch.matmul(Q, K.transpose(-2, -1))) / seq_len
+        # 注意力 logit
+        qk_attn = torch.matmul(Q, K.transpose(-2, -1))  # [B,h,S,S]
+
+        # 原始 HSTU 的 ReLU 归一化（保留）
+        qk_attn = F.relu(qk_attn) / seq_len  # [B,h,S,S]
+
+        # 处理 bias 的形状与掩码
+        if rel_pos_bias is None:
+            rel_pos_bias = torch.zeros(1, seq_len, seq_len, device=x.device, dtype=V.dtype)
+        if rel_ts_bias is None:
+            rel_ts_bias = torch.zeros(batch_size, seq_len, seq_len, device=x.device, dtype=V.dtype)
+
+        # 将 [1,S,S] 的 rel_pos_bias 按 batch 扩展，便于逐样本屏蔽
+        if rel_pos_bias.shape[0] == 1 and batch_size > 1:
+            rel_pos_bias = rel_pos_bias.expand(batch_size, -1, -1).contiguous()  # [B,S,S]
 
         if attn_mask is not None:
-            attn_weights.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float(0.0))
+            # qk_attn: [B,h,S,S] 用 [B,1,S,S] 屏蔽
+            mask4attn = attn_mask.unsqueeze(1)  # [B,1,S,S]
+            qk_attn = qk_attn.masked_fill(mask4attn.logical_not(), 0.0)
+            # 对两个 bias 用 [B,S,S] 屏蔽
+            rel_pos_bias = rel_pos_bias.masked_fill(attn_mask.logical_not(), 0.0)  # [B,S,S]
+            rel_ts_bias = rel_ts_bias.masked_fill(attn_mask.logical_not(), 0.0)    # [B,S,S]
 
-        attn_output = torch.matmul(attn_weights, V)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-        output = self.out_linear(torch.cat([U, attn_output, attn_output * U], dim=-1))
+        # 三路输出
+        pos_output = torch.einsum("bnm,bhmd->bnhd", rel_pos_bias, V)  # [B,S,h,d]
+        ts_output = torch.einsum("bnm,bhmd->bnhd", rel_ts_bias, V)    # [B,S,h,d]
+        attn_output = torch.einsum("bhnm,bhmd->bnhd", qk_attn, V)     # [B,S,h,d]
+
+        combined_output = torch.cat([pos_output, ts_output, attn_output], dim=-1).contiguous()  # [B,S,h,3d]
+        combined_output = combined_output.view(batch_size, seq_len, self.hidden_units * 3)      # [B,S,3H]
+
+        output = self.out_linear(combined_output * U)
         output = self.rms_norm(output + x)  # DeepNorm
         return output
 
@@ -160,8 +196,8 @@ class FeatureInteractionEncoder(torch.nn.Module):
     def __init__(self, input_dim, output_dim, dropout_rate, expansion_factor=4):
         """
         Args:
-            all_dim: 输入的维度。
-            hidden_units: 输出的维度。
+            input_dim: 输入的维度。
+            output_dim: 输出的维度。
             dropout_rate: Dropout 概率。
             expansion_factor: 中间层维度的扩展因子。
         """
@@ -169,18 +205,17 @@ class FeatureInteractionEncoder(torch.nn.Module):
         self.output_dim = output_dim
         self.expansion_factor = expansion_factor
         self.down_proj = torch.nn.Linear(input_dim, output_dim, bias=False)
-        self.linear = torch.nn.Sequential(torch.nn.Linear(output_dim, output_dim * expansion_factor, bias=False),
-                                          torch.nn.ReLU(),
-                                          torch.nn.Dropout(dropout_rate))
+        self.linear = torch.nn.Sequential(
+            torch.nn.Linear(output_dim, output_dim * expansion_factor, bias=False),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout_rate),
+        )
 
     def forward(self, X):
         """
-        Args:
-            inputs: 输入张量，形状为 (batch_size, seq_len, all_emb_dim)
-        Returns:
-            outputs: 输出张量，形状为 (batch_size, seq_len, hidden_units)
+        inputs: [B, S, D]
+        returns: [B, S, output_dim]
         """
-        # inputs: [B, S, D]
         batch_size, seq_len, D = X.size()
         X = self.down_proj(X)
         H = self.linear(X).view(-1, seq_len, self.expansion_factor, self.output_dim)
@@ -201,14 +236,13 @@ class BaselineModel(torch.nn.Module):
         user_num: 用户数量
         item_num: 物品数量
         dev: 设备
-        norm_first: 是否先归一化
         maxlen: 序列最大长度
         item_emb: Item Embedding Table
         user_emb: User Embedding Table
         sparse_emb: 稀疏特征Embedding Table
         emb_transform: 多模态特征的线性变换
-        userdnn: 用户特征拼接后经过的全连接层
-        itemdnn: 物品特征拼接后经过的全连接层
+        user_item_dnn: 用户+物品特征交互编码器
+        item_dnn: 物品侧特征编码器
     """
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
@@ -223,15 +257,17 @@ class BaselineModel(torch.nn.Module):
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.embedding_dim, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
         self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+
+        # 新增：相对时间/位置偏置模块
+
+        self.rel_time_pos_bias = SeparatedRelativeTimeAndPositionBias(
+            max_seq_len=args.maxlen + 1,  # 数据集中 S = maxlen+1
+            num_buckets=128,
+            bucketization_fn=lambda x: (torch.log(torch.abs(x).clamp(min=1)) / 0.301).long()
+        )
+
         # 新增：绝对时间编码 + 周期特征嵌入（weekday / is_weekend / hour）
         self.time_abs_enc = FourierTimeEncoding(hidden_units=args.hidden_units)
-        # 新增：相对时间分桶嵌入（Embedding 表）
-        self.time_rel_bucket = RelativeTimeBucketEmbedding(
-            hidden_units=args.hidden_units,
-            num_buckets=getattr(args, "rel_num_buckets", 48),
-            unit_seconds=getattr(args, "rel_unit_seconds", 60.0),  # 以分钟为粒度
-            max_seconds=getattr(args, "rel_max_seconds", 40 * 86400.0),  # 覆盖到40天
-        )
         # 周期特征嵌入（+1 预留0给padding）
         self.hour_emb = torch.nn.Embedding(24 + 1, args.hidden_units, padding_idx=0)
         self.dow_emb = torch.nn.Embedding(7 + 1, args.hidden_units, padding_idx=0)
@@ -253,14 +289,13 @@ class BaselineModel(torch.nn.Module):
             self.USER_CONTINUAL_FEAT
         )
         itemdim = (
-                args.embedding_dim * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
-                + len(self.ITEM_CONTINUAL_FEAT)
-                + args.embedding_dim * len(self.ITEM_EMB_FEAT)
+            args.embedding_dim * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
+            + len(self.ITEM_CONTINUAL_FEAT)
+            + args.embedding_dim * len(self.ITEM_EMB_FEAT)
         )
         all_dim = userdim + itemdim
 
         self.user_item_dnn = FeatureInteractionEncoder(all_dim, args.hidden_units, args.dropout_rate)
-
         self.item_dnn = FeatureInteractionEncoder(itemdim, args.hidden_units, args.dropout_rate)
 
         for _ in range(args.num_blocks):
@@ -341,7 +376,7 @@ class BaselineModel(torch.nn.Module):
                 user_feat_list.append(tens.to(self.dev).unsqueeze(2))
 
         if include_user:
-            all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # B S D
+            all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # [B, S, D]
             seqs_emb = self.user_item_dnn(all_user_item_emb)
         else:
             all_item_emb = torch.concat(item_feat_list, dim=-1)
@@ -358,48 +393,47 @@ class BaselineModel(torch.nn.Module):
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim ** 0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= log_seqs != 0
+        poss *= (log_seqs != 0)
         seqs += self.pos_emb(poss)
 
         # =========== 绝对时间编码 + 三个周期特征 ===========
-        ts = seq_ts.to(self.dev, non_blocking=True)  # [B,S]
-        valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S]
+        ts = seq_ts.to(self.dev).long()  # [B,S] 绝对时间戳（秒）
+        valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S] True=有效token
 
-        hour = ((ts % 86400) // 3600) + 1
-        dow = (((ts // 86400) + 4) % 7) + 1
-        weekend_flag = (dow >= 6).long() + 1
+        # 周期时间特征：hour(1..24), dow(1..7, ISO: 周一=1), is_weekend(1=工作日, 2=周末)
+        hour = ((ts % 86400) // 3600) + 1  # 1..24
+        dow = (((ts // 86400) + 4) % 7) + 1  # 1..7（1970-01-01是周四(+4)）
+        weekend_flag = (dow >= 6).long() + 1  # 1=工作日, 2=周末
 
+        # padding 置 0（embedding 的 padding_idx=0）
         hour = torch.where(valid, hour, torch.zeros_like(hour))
         dow = torch.where(valid, dow, torch.zeros_like(dow))
         weekend = torch.where(valid, weekend_flag, torch.zeros_like(weekend_flag))
 
+        # 绝对时间傅里叶编码（零出 padding 位置）
         time_abs = self.time_abs_enc(ts)  # [B,S,H]
         time_abs = time_abs * valid.unsqueeze(-1)
-
         seqs += self.hour_emb(hour) + self.dow_emb(dow) + self.weekend_emb(weekend) + time_abs
-
-        # =========== 相对时间偏差（相邻 Δt 的分桶 Embedding） ===========
-        # 计算相邻时间差：首位或前一位无效，则不加偏置
-        ts_prev = torch.cat([ts[:, :1], ts[:, :-1]], dim=1)  # [B,S]
-        prev_valid = torch.cat([valid[:, :1], valid[:, :-1]], dim=1)  # [B,S]
-
-        dt_prev = torch.clamp(ts - ts_prev, min=0)  # [B,S] 负数截断为0
-        # 仅当 当前有效 且 前一位有效 且 dt>0 时才使用相对时间嵌入
-        rel_valid = valid & prev_valid & (dt_prev > 0)
-
-        time_rel = self.time_rel_bucket(dt_prev, rel_valid)  # [B,S,H]
-        seqs += time_rel
 
         seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
-        attention_mask_tril = torch.tril(ones_matrix)
-        attention_mask_pad = (mask != 0).to(self.dev)
-        attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
+        attention_mask_tril = torch.tril(ones_matrix)  # [S,S]
+        key_query_valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S]
+        # 同时屏蔽 pad 的 query 行与 key 列，并保留下三角
+        attention_mask = (
+            attention_mask_tril.unsqueeze(0)
+            & key_query_valid.unsqueeze(2)
+            & key_query_valid.unsqueeze(1)
+        )  # [B,S,S]
+
+        # =========== 相对时间偏置（正确的 pairwise t_i - t_j） ===========
+        # rel_ts_bias: [B,S,S]
+        rel_pos_bias, rel_ts_bias = self.rel_time_pos_bias(ts, key_query_valid)
 
         for i in range(len(self.attention_layers)):
-            seqs = self.attention_layers[i](seqs, attn_mask=attention_mask)
+            seqs = self.attention_layers[i](seqs, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias)
         log_feats = F.normalize(seqs, dim=-1)
         return log_feats
 
