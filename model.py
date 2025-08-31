@@ -7,6 +7,76 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
+class RotaryEmbedding(torch.nn.Module):
+    """
+    标准 RoPE（Rotary Positional Embedding）实现。
+    将多头中每个 head 的前 rotary_dim 维进行旋转；其余维度保持不变。
+    """
+    def __init__(self, head_dim: int, rope_base: float = 10000.0, rope_fraction: float = 1.0):
+        """
+        Args:
+            head_dim: 每个注意力头的维度 d
+            rope_base: RoPE 的频率基数（常用 10000）
+            rope_fraction: 使用前多少比例维度用于旋转（0~1]；默认为 1.0 即全部 head_dim
+        """
+        super().__init__()
+        rotary_dim = int(head_dim * float(rope_fraction))
+        # 需要偶数维；若为奇数，则下取偶数；同时至少保留 2 维
+        rotary_dim = max(2, rotary_dim - (rotary_dim % 2))
+        self.head_dim = head_dim
+        self.rotary_dim = rotary_dim
+        # inv_freq: [rotary_dim/2]
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _build_cos_sin(self, seq_len: int, device, dtype):
+        """
+        返回：
+            cos, sin: [1, 1, S, rotary_dim]，用于广播到 [B,h,S,rotary_dim]
+        """
+        # 时刻索引 0..S-1
+        t = torch.arange(seq_len, device=device, dtype=dtype)  # [S]
+        freqs = torch.einsum("s,f->sf", t, self.inv_freq.to(device=device, dtype=dtype))  # [S, rotary_dim/2]
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+        # 将 [S, d/2] 交错扩展到 [S, d]
+        cos = torch.stack([cos, cos], dim=-1).reshape(seq_len, -1)  # [S, rotary_dim]
+        sin = torch.stack([sin, sin], dim=-1).reshape(seq_len, -1)  # [S, rotary_dim]
+        # 扩展以便广播到 [B,h,S,rotary_dim]
+        cos = cos.unsqueeze(0).unsqueeze(0)  # [1,1,S,rotary_dim]
+        sin = sin.unsqueeze(0).unsqueeze(0)  # [1,1,S,rotary_dim]
+        return cos, sin
+
+    @staticmethod
+    def _rotate_half(x):
+        # x: [..., rotary_dim]，把偶/奇维配对做旋转
+        x1, x2 = x[..., ::2], x[..., 1::2]     # [..., d/2], [..., d/2]
+        x_rot = torch.stack((-x2, x1), dim=-1) # [..., d/2, 2]
+        return x_rot.flatten(-2)               # [..., d]
+
+    def apply_rotary(self, q: torch.Tensor, k: torch.Tensor):
+        """
+        对 Q/K 应用 RoPE。q,k: [B,h,S,d]
+        仅对前 rotary_dim 维进行旋转；其余维度保持不变。
+        """
+        B, H, S, D = q.shape
+        assert D == self.head_dim, "Q/K head_dim mismatch"
+        if self.rotary_dim == 0:
+            return q, k
+
+        # 计算 cos/sin
+        cos, sin = self._build_cos_sin(S, q.device, q.dtype)  # [1,1,S,rotary_dim]
+
+        def _apply(x):
+            x_rot, x_pass = x[..., :self.rotary_dim], x[..., self.rotary_dim:]  # [B,h,S,rd], [B,h,S, D-rd]
+            x_rotated = x_rot * cos + self._rotate_half(x_rot) * sin
+            return torch.cat([x_rotated, x_pass], dim=-1)
+
+        q = _apply(q)
+        k = _apply(k)
+        return q, k
+
+
 class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
     """
     生成两类 bias（logits）：
@@ -20,7 +90,6 @@ class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
         self.bucketization_fn = bucketization_fn
         # 可学习参数
         self.ts_w = torch.nn.Parameter(torch.empty(num_buckets + 1).normal_(mean=0.0, std=0.02))
-        self.pos_w = torch.nn.Parameter(torch.empty(2 * max_seq_len - 1).normal_(mean=0.0, std=0.02))
         # 将 padding 桶(0)的偏置初始化为 0，避免无效位产生无用偏置
         with torch.no_grad():
             self.ts_w[0].zero_()
@@ -34,13 +103,6 @@ class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
           rel_ts_bias:  [B, S, S]
         """
         B, S = timestamps.shape
-
-        # 相对位置偏置（Toeplitz），支持 S <= max_seq_len；保持 [1,S,S] 以减少显存，通过广播加到 [B,S,S]
-        pos_vec = self.pos_w[: 2 * S - 1]  # 中心在 S-1
-        t = F.pad(pos_vec, [0, S]).repeat(S)
-        t = t[..., :-S].reshape(1, S, 3 * S - 2)
-        r = (2 * S - 1) // 2
-        rel_pos_bias = t[:, :, r:-r]  # [1, S, S]
 
         # 成对相对时间：t_i - t_j（因果：i >= j 时才有效；负数截断为 0）
         ti = timestamps.unsqueeze(2)             # [B, S, 1]
@@ -64,7 +126,7 @@ class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
 
         # 将桶号映射为标量偏置
         rel_ts_bias = self.ts_w[bucket_ids]       # [B, S, S]
-        return rel_pos_bias, rel_ts_bias
+        return rel_ts_bias
 
 
 class FourierTimeEncoding(torch.nn.Module):
@@ -76,8 +138,8 @@ class FourierTimeEncoding(torch.nn.Module):
     def __init__(
             self,
             hidden_units: int,
-            num_frequencies: int = 8,
-            min_period_seconds: float = 8 * 86400.0,  # 最短周期：1小时=3600.0，使用 8*86400.0 以防止与 hour、weekday、is_weekday 重复
+            num_frequencies: int = 12,
+            min_period_seconds: float = 86400.0,  # 最短周期：1小时=3600.0，使用 8*86400.0 以防止与 hour、weekday、is_weekday 重复
             max_period_seconds: float = 40 * 86400.0, # 最长周期（数据集似乎 40 天内）
     ):
         super().__init__()
@@ -109,7 +171,9 @@ class FourierTimeEncoding(torch.nn.Module):
 
 
 class HSTU(torch.nn.Module):
-    def __init__(self, hidden_units, num_heads, dropout_rate):
+    def __init__(self, hidden_units, num_heads, dropout_rate,
+                 rope_fraction: float = 1.0,
+                 rope_base: float = 10000.0):
         super(HSTU, self).__init__()
 
         self.hidden_units = hidden_units
@@ -122,13 +186,16 @@ class HSTU(torch.nn.Module):
 
         # FIX: 输出维度改为 6H（U:3H, V:H, Q:H, K:H）
         self.qkvu_linear = torch.nn.Sequential(
-            torch.nn.Linear(hidden_units, hidden_units * 6),
+            torch.nn.Linear(hidden_units, hidden_units * 6, bias=False),
             torch.nn.SiLU(),
         )
 
         self.out_linear = torch.nn.Linear(hidden_units * 3, hidden_units)
 
-    def forward(self, x, attn_mask=None, rel_pos_bias=None, rel_ts_bias=None):
+        self.rope = RotaryEmbedding(self.head_dim, rope_base=rope_base, rope_fraction=rope_fraction)
+
+
+    def forward(self, x, attn_mask=None, rel_ts_bias=None):
         """
         x: [B,S,H]
         attn_mask: [B,S,S]，True=允许；False=屏蔽
@@ -155,42 +222,40 @@ class HSTU(torch.nn.Module):
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B,h,S,d]
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [B,h,S,d]
 
+        # 应用 RoPE 到 Q/K（点积之前）
+        Q_rope, K_rope = self.rope.apply_rotary(Q, K)  # [B,h,S,d], [B,h,S,d]
+
         # 注意力 logit
         qk_attn = torch.matmul(Q, K.transpose(-2, -1))  # [B,h,S,S]
-
-        # 原始 HSTU 的 ReLU 归一化（保留）
         qk_attn = F.relu(qk_attn) / seq_len  # [B,h,S,S]
 
-        # 处理 bias 的形状与掩码
-        if rel_pos_bias is None:
-            rel_pos_bias = torch.zeros(1, seq_len, seq_len, device=x.device, dtype=V.dtype)
+        qk_attn_rope = torch.matmul(Q_rope, K_rope.transpose(-2, -1))  # [B,h,S,S]
+        qk_attn_rope = F.relu(qk_attn_rope) / seq_len  # [B,h,S,S]
+
+
         if rel_ts_bias is None:
             rel_ts_bias = torch.zeros(batch_size, seq_len, seq_len, device=x.device, dtype=V.dtype)
 
-        # 将 [1,S,S] 的 rel_pos_bias 按 batch 扩展，便于逐样本屏蔽
-        if rel_pos_bias.shape[0] == 1 and batch_size > 1:
-            rel_pos_bias = rel_pos_bias.expand(batch_size, -1, -1).contiguous()  # [B,S,S]
 
         if attn_mask is not None:
             # qk_attn: [B,h,S,S] 用 [B,1,S,S] 屏蔽
             mask4attn = attn_mask.unsqueeze(1)  # [B,1,S,S]
             qk_attn = qk_attn.masked_fill(mask4attn.logical_not(), 0.0)
+            qk_attn_rope = qk_attn_rope.masked_fill(mask4attn.logical_not(), 0.0)
             # 对两个 bias 用 [B,S,S] 屏蔽
-            rel_pos_bias = rel_pos_bias.masked_fill(attn_mask.logical_not(), 0.0)  # [B,S,S]
             rel_ts_bias = rel_ts_bias.masked_fill(attn_mask.logical_not(), 0.0)    # [B,S,S]
 
         # 三路输出
-        pos_output = torch.einsum("bnm,bhmd->bnhd", rel_pos_bias, V)  # [B,S,h,d]
         ts_output = torch.einsum("bnm,bhmd->bnhd", rel_ts_bias, V)    # [B,S,h,d]
+        attn_output_rope = torch.einsum("bhnm,bhmd->bnhd", qk_attn_rope, V)     # [B,S,h,d]
         attn_output = torch.einsum("bhnm,bhmd->bnhd", qk_attn, V)     # [B,S,h,d]
 
-        combined_output = torch.cat([pos_output, ts_output, attn_output], dim=-1).contiguous()  # [B,S,h,3d]
+        combined_output = torch.cat([attn_output_rope, ts_output, attn_output], dim=-1).contiguous()  # [B,S,h,3d]
         combined_output = combined_output.view(batch_size, seq_len, self.hidden_units * 3)      # [B,S,3H]
 
         output = self.out_linear(combined_output * U)
         output = self.rms_norm(output + x)  # DeepNorm
         return output
-
 
 class FeatureInteractionEncoder(torch.nn.Module):
     def __init__(self, input_dim, output_dim, dropout_rate, expansion_factor=4):
@@ -252,16 +317,19 @@ class BaselineModel(torch.nn.Module):
         self.item_num = item_num
         self.dev = args.device
         self.maxlen = args.maxlen
+        self.hidden_units = args.hidden_units
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.embedding_dim, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
 
         # 相对时间/位置偏置
         self.rel_time_pos_bias = SeparatedRelativeTimeAndPositionBias(
             max_seq_len=args.maxlen + 1,
             num_buckets=128,
-            bucketization_fn=lambda x: (torch.log(torch.abs(x).clamp(min=1)) / 0.301).long()
+            bucketization_fn=lambda x: torch.clamp(
+                (torch.log2(x.clamp(min=1.0)).floor() + 1).long(),  # 1,2,...  (delta=1 -> 1)
+                min=1, max=128
+            )
         )
 
         # 绝对时间编码（仍作为 add-on 特征加到序列表示上）
@@ -356,12 +424,12 @@ class BaselineModel(torch.nn.Module):
         Returns:
             seqs_emb: [B, S, H]（经对应的 DNN 编码后）
         """
-        seq = seq.to(self.dev, non_blocking=True)
+        seq = seq.to(self.dev)
 
         # 初始化 item/user id embedding
         if include_user:
-            user_mask = (mask == 2).to(self.dev, non_blocking=True)
-            item_mask = (mask == 1).to(self.dev, non_blocking=True)
+            user_mask = (mask == 2).to(self.dev)
+            item_mask = (mask == 1).to(self.dev)
             user_embedding = self.user_emb(user_mask * seq)
             item_embedding = self.item_emb(item_mask * seq)
             item_feat_list = [item_embedding]
@@ -376,21 +444,20 @@ class BaselineModel(torch.nn.Module):
         # 仅保留普通 item 稀疏特征；交叉特征只在 user_item 路径启用
         for k, tens in ft.get('item_sparse', {}).items():
             if (k in self.ITEM_SPARSE_FEAT) or (include_user and (k in self.ITEM_CROSS_FEAT)):
-                item_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)))
+                item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
         for k, tens in ft.get('item_array', {}).items():
-            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)).sum(2))
+            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
         for k, tens in ft.get('item_continual', {}).items():
-            item_feat_list.append(tens.to(self.dev, non_blocking=True).unsqueeze(2))
+            item_feat_list.append(tens.to(self.dev).unsqueeze(2))
         for k in self.ITEM_EMB_FEAT:
             if k in ft.get('item_emb', {}):
-                t = ft['item_emb'][k].to(self.dev, non_blocking=True)
+                t = ft['item_emb'][k].to(self.dev)
                 item_feat_list.append(self.emb_transform[k](t))
 
         # 将 hour / dow / weekend 作为“item 侧稀疏特征”拼到 user_item 路径
         if include_user and (seq_ts is not None):
-            ts = seq_ts.to(self.dev, non_blocking=True).long()  # [B,S]
-            is_item = (mask == 1).to(self.dev, non_blocking=True) if mask is not None else torch.ones_like(ts, dtype=torch.bool)
-
+            ts = seq_ts.to(self.dev).long()  # [B,S]
+            is_item = (mask == 1).to(self.dev) if mask is not None else torch.ones_like(ts, dtype=torch.bool)
             hour_idx = ((ts % 86400) // 3600) + 1          # 1..24
             dow_idx = (((ts // 86400) + 4) % 7) + 1        # 1..7
             weekend_idx = (dow_idx >= 6).long() + 1        # 1=工作日, 2=周末
@@ -407,11 +474,11 @@ class BaselineModel(torch.nn.Module):
         # user 特征（仅在 include_user=True 时使用）
         if include_user:
             for k, tens in ft.get('user_sparse', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)))
+                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
             for k, tens in ft.get('user_array', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev, non_blocking=True)).sum(2))
+                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
             for k, tens in ft.get('user_continual', {}).items():
-                user_feat_list.append(tens.to(self.dev, non_blocking=True).unsqueeze(2))
+                user_feat_list.append(tens.to(self.dev).unsqueeze(2))
 
         if include_user:
             all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # [B,S,D_user_item]
@@ -431,15 +498,11 @@ class BaselineModel(torch.nn.Module):
 
         # 加入 seq_ts，使 hour/dow/weekend 作为 item 特征进入 user_item_dnn
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, seq_ts=seq_ts)
-        seqs *= self.item_emb.embedding_dim ** 0.5
-
-        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= (log_seqs != 0)
-        seqs += self.pos_emb(poss)
+        seqs *= self.hidden_units ** 0.5
 
         # 仅保留绝对时间傅里叶特征作为加性偏置（padding 位置为 0）
-        ts = seq_ts.to(self.dev, non_blocking=True).long()                         # [B,S]
-        valid = (mask != 0).to(torch.bool).to(self.dev, non_blocking=True)         # [B,S]
+        ts = seq_ts.to(self.dev).long()                         # [B,S]
+        valid = (mask != 0).to(torch.bool).to(self.dev)         # [B,S]
         time_abs = self.time_abs_enc(ts) * valid.unsqueeze(-1)  # [B,S,H]
         seqs += time_abs
 
@@ -448,7 +511,7 @@ class BaselineModel(torch.nn.Module):
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
         attention_mask_tril = torch.tril(ones_matrix)  # [S,S]
-        key_query_valid = (mask != 0).to(torch.bool).to(self.dev, non_blocking=True)  # [B,S]
+        key_query_valid = (mask != 0).to(torch.bool).to(self.dev)  # [B,S]
         attention_mask = (
             attention_mask_tril.unsqueeze(0)
             & key_query_valid.unsqueeze(2)
@@ -456,11 +519,11 @@ class BaselineModel(torch.nn.Module):
         )  # [B,S,S]
 
         # 相对时间/位置偏置
-        rel_pos_bias, rel_ts_bias = self.rel_time_pos_bias(ts, key_query_valid)
+        rel_ts_bias = self.rel_time_pos_bias(ts, key_query_valid)
 
         for i in range(len(self.attention_layers)):
             seqs = self.attention_layers[i](
-                seqs, attn_mask=attention_mask, rel_pos_bias=rel_pos_bias, rel_ts_bias=rel_ts_bias
+                seqs, attn_mask=attention_mask, rel_ts_bias=rel_ts_bias
             )
         log_feats = F.normalize(seqs, dim=-1)
         return log_feats

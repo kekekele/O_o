@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import MyTestDataset, save_emb   # 注意：引用本回答的 datasetv2.py
+from dataset import MyTestDataset, save_emb
 from model import BaselineModel
 
 
@@ -33,7 +33,7 @@ def get_args():
     parser.add_argument('--seed', default=20252026, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--embedding_dim', default=64, type=int)
+    parser.add_argument('--embedding_dim', default=128, type=int)
     parser.add_argument('--hidden_units', default=256, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=1, type=int)
@@ -43,8 +43,8 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
 
-    # Loss
     parser.add_argument('--temperature', default=0.05, type=float)
+    parser.add_argument('--neg_pop_alpha', default=0.15, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
 
     # MMemb Feature ID
@@ -54,13 +54,13 @@ def get_args():
     parser.add_argument('--top_k', default=10, type=int)
     parser.add_argument('--torch_query_bs', default=None, type=int, help='查询分块大小（默认: cuda=1024, cpu=256）')
     parser.add_argument('--torch_item_bs', default=None, type=int, help='库向量分块大小（默认: cuda=16384, cpu=8192）')
-    parser.add_argument('--use_fp16', action='store_true', help='在 CUDA 上使用半精度进行相似度计算')
+    parser.add_argument('--use_fp16', default=False, action='store_true', help='在 CUDA 上使用半精度进行相似度计算')
 
     # DataLoader workers（推理）
     parser.add_argument('--num_workers', default=8, type=int)
 
     # 可选：直接在推理端声明组合（若未能读取到清单文件时作为兜底）
-    parser.add_argument('--feature_crosses', nargs='*', default=["118+120"],
+    parser.add_argument('--feature_crosses', nargs='*', default=["118+120", "116+118"],
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
 
     args = parser.parse_args()
@@ -143,19 +143,53 @@ def _cross_key_from_fields(fields: List[str]) -> str:
     fields = [str(f) for f in fields]
     return "x" + "_".join(fields)
 
+def _load_cross_specs_from_manifest_infer():
+    """
+    在候选路径中搜索 feature_cross_manifest__*.json，
+    选择一个有效清单并返回 list[{'fields': [...], 'key': 'x...'}]
+    """
+    best = None
+    best_len = -1
+    for root in _search_paths_for_infer():
+        try:
+            for p in root.glob("feature_cross_manifest__*.json"):
+                with open(p, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                xs = []
+                for item in manifest.get("crosses", []):
+                    fields = [str(x) for x in item.get("fields", [])]
+                    fields = sorted(fields, key=lambda x: int(x) if x.isdigit() else x)
+                    key = str(item.get("key", _cross_key_from_fields(fields)))
+                    xs.append({"fields": fields, "key": key})
+                if xs and len(xs) > best_len:
+                    best = xs
+                    best_len = len(xs)
+                    print(f"Loaded cross manifest: {p}")
+        except Exception as e:
+            print(f"warn: failed scanning manifests under {root}: {e}")
+    return best if best is not None else []
+
+
 def _parse_cross_specs_for_infer(args) -> List[Dict]:
-    # 显式配置优先；未配置则禁用
+    """
+    优先读取 args.feature_crosses / FEATURE_CROSSES；
+    若为空，则兜底读取任意 feature_cross_manifest__*.json
+    """
     raw = getattr(args, "feature_crosses", None)
     if raw is None:
         raw = os.environ.get("FEATURE_CROSSES", None)
 
-    # None/空字符串/空列表 => 禁用
+    # None/空 -> 尝试从 manifest 兜底加载
     if raw is None or raw == "" or (isinstance(raw, (list, tuple)) and len(raw) == 0):
+        specs = _load_cross_specs_from_manifest_infer()
+        if specs:
+            return specs
         print("[feature crosses] infer: disabled (feature_crosses is None/empty)")
         return []
 
+    # 显式配置 -> 正常解析
     if isinstance(raw, str):
-        items = [s for s in raw.strip().split() if s]
+        items = [s for s in raw.strip().replace(",", "+").split() if s]
     else:
         items = list(raw)
 
@@ -167,10 +201,7 @@ def _parse_cross_specs_for_infer(args) -> List[Dict]:
             fields = sorted([str(f) for f in fields], key=lambda x: int(x) if x.isdigit() else x)
             specs.append({"fields": fields, "key": _cross_key_from_fields(fields)})
 
-    # 去重
-    uniq = {}
-    for sp in specs:
-        uniq[sp["key"]] = sp
+    uniq = {sp["key"]: sp for sp in specs}
     return list(uniq.values())
 
 def _load_cross_maps_for_infer(args):
@@ -198,12 +229,9 @@ def _load_cross_maps_for_infer(args):
 # ==========================================================
 
 
-def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
+def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model, args):
     """
     生产候选库item的id和embedding，并落盘 embedding.fbin / id.u64bin
-
-    Returns:
-        retrieve_id2creative_id: 索引id->creative_id的dict
     """
     EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     candidate_path = Path(os.environ.get('EVAL_DATA_PATH'), 'predict_set.jsonl')
@@ -212,13 +240,13 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
 
     # 载入点击桶映射
     click_bucket_map = _load_click_bucket_map_for_infer()
-    # 载入特征组合映射
-    # 这里不直接调用 _load_cross_maps_for_infer(args) 因为 get_candidate_emb 没有 args，
-    # 我们从环境变量推断或读取清单文件（复用上面的工具）
-    class _Dummy: pass
-    _d = _Dummy()
-    setattr(_d, "feature_crosses", os.environ.get("FEATURE_CROSSES", None))
-    cross_specs, cross_maps = _load_cross_maps_for_infer(_d)
+    # 载入特征组合映射（修复：直接用 args + manifest 兜底）
+    cross_specs, cross_maps = _load_cross_maps_for_infer(args)
+
+    # 可选：与数据集/模型中声明的 item_cross 对齐（若存在）
+    allowed = set(feat_types.get('item_cross', [])) if isinstance(feat_types, dict) else set()
+    if allowed:
+        cross_specs = [sp for sp in cross_specs if sp['key'] in allowed]
 
     def _to_int_safe(v):
         if type(v) == list:
@@ -231,11 +259,11 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
     with open(candidate_path, 'r') as f:
         for line in f:
             line = json.loads(line)
-            # 读取item特征，并补充缺失值
             feature = line['features']
             creative_id = line['creative_id']
             retrieval_id = line['retrieval_id']
             item_id = indexer[creative_id] if creative_id in indexer else 0
+
             missing_fields = set(
                 feat_types['item_sparse'] + feat_types['item_array'] + feat_types['item_continual']
             ) - set(feature.keys())
@@ -254,23 +282,18 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
             except Exception:
                 feature['901'] = 0
 
-            # 泛化：填充所有组合特征
+            # 组合特征（按 specs + 对应 map 填充）
             for sp in cross_specs:
                 key = sp['key']
-                fields = sp['fields']
                 vals = []
                 ok = True
-                for fid in fields:
+                for fid in sp['fields']:
                     v = _to_int_safe(feature.get(fid, 0))
                     if v <= 0:
                         ok = False
                         break
                     vals.append(v)
-                if ok:
-                    tkey = "_".join(str(x) for x in vals)
-                    feature[key] = int(cross_maps.get(key, {}).get(tkey, 0))
-                else:
-                    feature[key] = 0
+                feature[key] = int(cross_maps.get(key, {}).get("_".join(map(str, vals)), 0)) if ok else 0
 
             item_ids.append(item_id)
             creative_ids.append(creative_id)
@@ -278,12 +301,10 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
             features.append(feature)
             retrieve_id2creative_id[retrieval_id] = creative_id
 
-    # 保存候选库的embedding和sid
     model.save_item_emb(item_ids, retrieval_ids, features, os.environ.get('EVAL_RESULT_PATH'))
     with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
         json.dump(retrieve_id2creative_id, f)
     return retrieve_id2creative_id
-
 
 def read_matrix_bin(file_path: Path, dtype=np.float32) -> np.ndarray:
     """
@@ -411,6 +432,7 @@ def infer():
         test_dataset.feature_default_value,
         test_dataset.mm_emb_dict,
         model,
+        args,  # 新增
     )
 
     # 读取候选库向量与检索ID

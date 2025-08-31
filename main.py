@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import math
 import time
 import random
 from pathlib import Path
@@ -15,6 +16,7 @@ from tqdm import tqdm
 
 from dataset import MyDataset
 from model import BaselineModel
+
 
 # 可根据需要修改，或在外部设置
 # os.environ.setdefault("TRAIN_LOG_PATH", "./logs")
@@ -32,7 +34,7 @@ def get_args():
     parser.add_argument('--seed', default=20252026, type=int)
 
     # Baseline Model construction
-    parser.add_argument('--embedding_dim', default=64, type=int)
+    parser.add_argument('--embedding_dim', default=128, type=int)
     parser.add_argument('--hidden_units', default=256, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=3, type=int)
@@ -43,9 +45,18 @@ def get_args():
     parser.add_argument('--state_dict_path', default=None, type=str)
 
     parser.add_argument('--temperature', default=0.05, type=float)
+    parser.add_argument('--neg_pop_alpha', default=0.15, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
-    parser.add_argument('--feature_crosses', nargs='*', default=["118+120"],
+    parser.add_argument('--feature_crosses', nargs='*', default=["118+120", "116+118"],
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
+
+    # AMP: 混合精度训练
+    parser.add_argument(
+        '--amp',
+        default='auto',
+        choices=['off', 'fp16', 'bf16', 'auto'],
+        help='混合精度模式：off 关闭；fp16 半精度；bf16 bfloat16；auto 优先 bf16，不支持则回退 fp16'
+    )
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -151,58 +162,6 @@ def InfoNCE(
     return loss, stats
 
 
-@torch.no_grad()
-def evaluate_acc1(model, valid_loader, device, temperature=0.05):
-    """
-    更快速的评估：acc@1（top-1 命中率）
-    候选集与训练 InfoNCE 一致：每个查询的候选集=其正样本 + 批内 item 位置的负样本池。
-    仅在点击位置(next_action_type==1)计算。
-    """
-    model.eval()
-    total = 0
-    correct = 0
-
-    for batch in valid_loader:
-        (seq, pos, neg, token_type, next_token_type, next_action_type,
-         seq_feat, pos_feat, neg_feat, seq_ts) = batch
-
-        seq = seq.to(device, non_blocking=True)
-        pos = pos.to(device, non_blocking=True)
-        neg = neg.to(device, non_blocking=True)
-        token_type = token_type.to(device, non_blocking=True)
-        next_token_type = next_token_type.to(device, non_blocking=True)
-        next_action_type = next_action_type.to(device, non_blocking=True)
-
-        pos_embs, neg_embs, log_feats = model(
-            seq, pos, neg, token_type, next_token_type, next_action_type,
-            seq_feat, pos_feat, neg_feat, seq_ts
-        )  # [B,L,D] x3
-
-        # 只评估点击的 item 位置
-        mask = (next_token_type == 1) & (next_action_type == 1)
-        if mask.sum().item() == 0:
-            continue
-
-        Q = log_feats[mask]                       # [M,D]
-        P = pos_embs[mask]                        # [M,D]
-        N = neg_embs[next_token_type == 1]        # [N,D] 批内负样本池
-
-        # logits: 将正样本放在 index=0，其他为负样本
-        pos_logits = (Q * P).sum(dim=-1, keepdim=True)  # [M,1]
-        if N.numel() == 0:
-            logits = pos_logits
-        else:
-            neg_logits = Q @ N.t()                        # [M,N]
-            logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+N]
-
-        pred = torch.argmax(logits, dim=1)  # 预测索引
-        correct += (pred == 0).sum().item()
-        total += logits.size(0)
-
-    if total == 0:
-        return 0.0
-    return correct / total
-
 if __name__ == '__main__':
     # 路径与日志
     Path(os.environ.get('TRAIN_LOG_PATH')).mkdir(parents=True, exist_ok=True)
@@ -213,60 +172,87 @@ if __name__ == '__main__':
 
     args = get_args()
 
+    # CUDA/TF32 设置（在支持的 NVIDIA GPU 上进一步加速）
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # PyTorch 2.x：控制 FP32 matmul 的 TF32 精度
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+    # 解析 AMP 配置
+    use_cuda = torch.cuda.is_available() and str(args.device).startswith('cuda')
+    if args.amp == 'off' or not use_cuda:
+        amp_enabled = False
+        amp_dtype = None
+    else:
+        # auto: 优先 bfloat16，不支持则回退到 float16
+        bf16_ok = torch.cuda.is_bf16_supported()
+        if args.amp == 'bf16' or (args.amp == 'auto' and bf16_ok):
+            amp_enabled = True
+            amp_dtype = torch.bfloat16
+        else:
+            amp_enabled = True
+            amp_dtype = torch.float16
+
     # 固定随机种子
     set_seed(args.seed)
 
-    # 数据集与可复现划分
+    # 数据集（不再划分验证集，直接全量用于训练）
     dataset = MyDataset(data_path, args)
-    n_total = len(dataset)
-    n_valid = max(1, int(n_total * 0.1))
-    n_train = n_total - n_valid
-    split_gen = torch.Generator().manual_seed(args.seed)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [n_train, n_valid], generator=split_gen)
+    train_dataset = dataset  # 全量训练
 
-    # 在训练开始前，导出 item 点击分桶映射供推理使用
+    # 在训练开始前，导出 item 点击分桶映射供推理使用（若已存在则复用，不重复生成）
     try:
-        bucket = {}
-        for iid in range(1, dataset.itemnum + 1):
-            cnt = int(getattr(dataset, 'item_click_counts', np.zeros(1))[iid])
-            b = int(dataset._click_count_to_bucket(cnt)) if hasattr(dataset, '_click_count_to_bucket') else 1
-            bucket[iid] = b
-        # 保存到 USER_CACHE_PATH（优先），回退到 TRAIN_CKPT_PATH
+        # 构造候选保存路径（优先 USER_CACHE_PATH -> TRAIN_CKPT_PATH -> 当前目录）
         cache_root = os.environ.get("USER_CACHE_PATH", None)
-        out_paths = []
-        if cache_root:
-            Path(cache_root).mkdir(parents=True, exist_ok=True)
-            out_paths.append(Path(cache_root) / "item_click_bucket.json")
         ckpt_root = os.environ.get("TRAIN_CKPT_PATH", None)
+        candidates = []
+        if cache_root:
+            candidates.append(Path(cache_root) / "item_click_bucket.json")
         if ckpt_root:
-            Path(ckpt_root).mkdir(parents=True, exist_ok=True)
-            out_paths.append(Path(ckpt_root) / "item_click_bucket.json")
-        # 若都没有环境变量，则默认存到当前目录
-        if not out_paths:
-            out_paths.append(Path("./item_click_bucket.json"))
-        for p in out_paths:
-            with open(p, 'w', encoding='utf-8') as f:
-                json.dump(bucket, f)
-            print(f"Saved item_click_bucket.json -> {p}")
+            candidates.append(Path(ckpt_root) / "item_click_bucket.json")
+        if not candidates:
+            candidates.append(Path("./item_click_bucket.json"))
+
+        # 若任一位置已存在，则跳过生成与保存
+        exist_path = next((p for p in candidates if p.exists()), None)
+        if exist_path is not None:
+            print(f"item_click_bucket.json already exists at {exist_path}. Reusing and skip saving.")
+        else:
+            # 生成分桶映射
+            bucket = {}
+            for iid in range(1, dataset.itemnum + 1):
+                cnt = int(getattr(dataset, 'item_click_counts', np.zeros(1))[iid])
+                b = int(dataset._click_count_to_bucket(cnt)) if hasattr(dataset, '_click_count_to_bucket') else 1
+                bucket[iid] = b
+
+            # 保存到 USER_CACHE_PATH（优先），回退到 TRAIN_CKPT_PATH / 当前目录
+            out_paths = []
+            if cache_root:
+                Path(cache_root).mkdir(parents=True, exist_ok=True)
+                out_paths.append(Path(cache_root) / "item_click_bucket.json")
+            if ckpt_root:
+                Path(ckpt_root).mkdir(parents=True, exist_ok=True)
+                out_paths.append(Path(ckpt_root) / "item_click_bucket.json")
+            if not out_paths:
+                out_paths.append(Path("./item_click_bucket.json"))
+
+            for p in out_paths:
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump(bucket, f)
+                print(f"Saved item_click_bucket.json -> {p}")
     except Exception as e:
         print(f'warn: failed to dump item_click_bucket.json: {e}')
 
-    # DataLoader
+    # DataLoader（仅训练集）
     num_workers = 12
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None,
-        collate_fn=dataset.collate_fn,
-        pin_memory=torch.cuda.is_available(),
-        prefetch_factor=4
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
@@ -307,18 +293,32 @@ if __name__ == '__main__':
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=T_total - num_warmup_steps, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[num_warmup_steps])
 
+    # AMP GradScaler（bf16 不需要缩放；fp16 需要）
+    if amp_enabled and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+
     best_val_loss = float('inf')
     global_step = 0
 
     if args.inference_only:
         print("Inference only mode enabled. Skip training.")
     else:
-        print("Start training")
+        print(f"Start training (AMP: {'on' if amp_enabled else 'off'}, dtype={str(amp_dtype) if amp_enabled else 'fp32'})")
         for epoch in range(epoch_start_idx, args.num_epochs + 1):
             model.train()
+            pbar = tqdm(
+                enumerate(train_loader),
+                total=len(train_loader),
+                desc=f"Train epoch {epoch}",
+                dynamic_ncols=True,
+                leave=False,
+                bar_format='{l_bar}{bar}{r_bar}\n',
+            )
 
-            # 训练阶段（训练集）
-            for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            # 训练阶段（全量数据）
+            for step, batch in pbar:
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
                 device = args.device
                 seq = seq.to(device, non_blocking=True)
@@ -328,73 +328,49 @@ if __name__ == '__main__':
                 next_token_type = next_token_type.to(device, non_blocking=True)
                 next_action_type = next_action_type.to(device, non_blocking=True)
 
-                pos_embs, neg_embs, log_feats = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
-                )
-                loss, stats = InfoNCE(
-                    pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
-                    next_action_type=next_action_type
-                )
+                optimizer.zero_grad(set_to_none=True)
 
+                # AMP 前向与损失
+                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    pos_embs, neg_embs, log_feats = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
+                    )
+                    loss, stats = InfoNCE(
+                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
+                        next_action_type=next_action_type
+                    )
+
+                # 反向与优化（fp16 用 scaler，bf16/FP32 直接）
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    # 需先 unscale 再做梯度裁剪
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                scheduler.step()
+
+                # 日志
                 log_json = json.dumps(
                     {'global_step': global_step, 'loss': float(loss.item()), 'epoch': epoch,
                      'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
                 )
-                print(log_json)
                 log_file.write(log_json + '\n')
                 log_file.flush()
                 writer.add_scalar('Loss/train', loss.item(), global_step)
                 writer.add_scalar('Diag/mean_pos_sim', stats['mean_pos_sim'], global_step)
                 writer.add_scalar('Diag/mean_neg_sim', stats['mean_neg_sim'], global_step)
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-
                 global_step += 1
 
-            # 验证阶段（评估 loss）
-            model.eval()
-            valid_loss_sum = 0.0
-            with torch.no_grad():
-                for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader)):
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
-                    device = args.device
-                    seq = seq.to(device, non_blocking=True)
-                    pos = pos.to(device, non_blocking=True)
-                    neg = neg.to(device, non_blocking=True)
-                    token_type = token_type.to(device, non_blocking=True)
-                    next_token_type = next_token_type.to(device, non_blocking=True)
-                    next_action_type = next_action_type.to(device, non_blocking=True)
-
-                    pos_embs, neg_embs, log_feats = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
-                    )
-                    loss, _ = InfoNCE(
-                        pos_embs, neg_embs, log_feats, temperature=args.temperature, next_token_type=next_token_type,
-                        next_action_type=next_action_type
-                    )
-
-                    valid_loss_sum += loss.item()
-
-            valid_loss_avg = valid_loss_sum / max(1, len(valid_loader))
-            writer.add_scalar('Loss/valid', valid_loss_avg, global_step)
-
-            # 用更快的 acc@1 评估
-            acc1 = evaluate_acc1(model, valid_loader, device=args.device, temperature=args.temperature)
-            writer.add_scalar('Acc1/valid', acc1, global_step)
-            log_json = json.dumps(
-                {'global_step': global_step, 'epoch': epoch, 'valid_acc1': float(acc1), 'time': time.time()}
-            )
-            print(log_json)
-            log_file.write(log_json + '\n')
-            log_file.flush()
-
-            # 保存 checkpoint（文件名包含 acc1）
+            # 每个 epoch 结束后保存 checkpoint（不含验证指标）
             save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'),
-                            f"global_step{global_step}.valid_loss={valid_loss_avg:.4f}.acc1={acc1:.4f}")
+                            f"global_step{global_step}.epoch={epoch}")
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
 

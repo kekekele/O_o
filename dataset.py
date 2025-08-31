@@ -71,6 +71,17 @@ class MyDataset(torch.utils.data.Dataset):
         self.item_click_counts = self._compute_item_click_counts()
         self._click_bucket_map = self._load_click_bucket_map()
 
+        # ========== 新增：按流行度加权负采样的超参与采样器 ==========
+        _alpha = getattr(args, "neg_pop_alpha", 0.15)
+        if _alpha is None:
+            _alpha = os.environ.get("NEG_POP_ALPHA", "0.15")
+        self.neg_pop_alpha = float(_alpha)
+        _minc = getattr(args, "neg_pop_min_count", 1)
+        if _minc is None:
+            _minc = os.environ.get("NEG_POP_MIN_COUNT", "1")
+        self.neg_pop_min_count = int(_minc)
+        self._build_popularity_sampler()
+
         # ========== 特征组合：解析配置 -> (fields, key) 列表 ==========
         self.cross_specs = self._get_cross_specs(args)  # list[{'fields': [...], 'key': 'x100_101', 'size': int}]
         # 构建/加载各组合的映射表（fields 值串为 "v1_v2_..." -> id）
@@ -172,17 +183,76 @@ class MyDataset(torch.utils.data.Dataset):
         return data
 
     # ---------------------- 采样与统计 ----------------------
+    def _build_popularity_sampler(self):
+        """
+        基于 item_click_counts 构建按流行度加权的采样 CDF。
+        采样空间限定为合法 item（valid_item_ids ∩ (0, itemnum]）。
+        权重：w_i = max(count_i, min_count) ** alpha
+        """
+        try:
+            ids = self.valid_item_ids
+            if ids.size == 0:
+                self._neg_sample_ids = np.asarray([], dtype=np.int32)
+                self._neg_sample_cdf = np.asarray([], dtype=np.float64)
+                return
+
+            # 限定到合法范围 (0, itemnum]
+            mask = (ids > 0) & (ids <= self.itemnum)
+            ids = ids[mask]
+            if ids.size == 0:
+                self._neg_sample_ids = np.asarray([], dtype=np.int32)
+                self._neg_sample_cdf = np.asarray([], dtype=np.float64)
+                return
+
+            counts = self.item_click_counts[ids] if hasattr(self, 'item_click_counts') else np.zeros_like(ids,
+                                                                                                          dtype=np.int32)
+            counts = np.maximum(counts, int(self.neg_pop_min_count)).astype(np.float64)
+
+            alpha = float(self.neg_pop_alpha)
+            weights = np.power(counts, alpha)
+            total = np.sum(weights)
+            if not np.isfinite(total) or total <= 0:
+                # 退化为均匀分布
+                weights = np.ones_like(ids, dtype=np.float64)
+                total = float(weights.size)
+
+            cdf = np.cumsum(weights) / total
+
+            self._neg_sample_ids = ids.astype(np.int32, copy=False)
+            self._neg_sample_cdf = cdf.astype(np.float64, copy=False)
+        except Exception as e:
+            print(f"warn: build popularity sampler failed: {e}")
+            self._neg_sample_ids = np.asarray([], dtype=np.int32)
+            self._neg_sample_cdf = np.asarray([], dtype=np.float64)
+
+    def _sample_popular_item(self) -> int:
+        """
+        从 CDF 中按权重采样一个 item_id
+        """
+        if getattr(self, "_neg_sample_ids", None) is None or self._neg_sample_ids.size == 0:
+            return 0
+        r = np.random.random()
+        idx = int(np.searchsorted(self._neg_sample_cdf, r, side="right"))
+        if idx >= self._neg_sample_ids.size:
+            idx = self._neg_sample_ids.size - 1
+        return int(self._neg_sample_ids[idx])
 
     def _random_neq(self, hist_set):
         """
-        生成一个不在序列 hist_set 中的随机 item（仅从有特征的合法 item 中采样）
+        生成一个不在序列 hist_set 中的随机 item（按流行度加权）
+        退化与回退：
+          - 若采样器不可用则回退到原先的均匀随机
+          - 若多次拒绝失败则回退到均匀随机尝试
         """
+        # 优先使用加权采样 + 拒绝
+        if getattr(self, "_neg_sample_ids", None) is not None and self._neg_sample_ids.size > 0:
+            for _ in range(32):
+                cand = self._sample_popular_item()
+                if cand not in hist_set:
+                    return cand
+        # 回退：均匀随机
         if self.valid_item_ids.size == 0:
             return 0
-        for _ in range(16):
-            cand = int(self.valid_item_ids[np.random.randint(0, self.valid_item_ids.size)])
-            if cand not in hist_set:
-                return cand
         for _ in range(256):
             cand = int(self.valid_item_ids[np.random.randint(0, self.valid_item_ids.size)])
             if cand not in hist_set:
@@ -360,12 +430,28 @@ class MyDataset(torch.utils.data.Dataset):
     def _save_cross_manifest(self, specs):
         if not specs:
             return
-        manifest = {"crosses": [{"fields": s["fields"], "key": s["key"], "size": int(s.get("size", 0))} for s in specs]}
+        # 统一生成/获取文件名
         filename = getattr(self, "_manifest_filename", None)
         if not filename:
             sig = "__".join(sorted([self._cross_key_from_fields(s["fields"]) for s in specs]))
             filename = f"feature_cross_manifest__{sig}.json"
             self._manifest_filename = filename
+        # 若任一候选路径已存在，直接复用并跳过保存
+        for root in self._search_paths_for_cross_files():
+            p = root / filename
+            try:
+                if p.exists():
+                    print(f"{filename} already exists at {p}. Reusing and skip saving.")
+                    return
+            except Exception:
+                pass
+        # 不存在则正常写盘
+        manifest = {
+            "crosses": [
+                {"fields": s["fields"], "key": s["key"], "size": int(s.get("size", 0))}
+                for s in specs
+            ]
+        }
         self._save_json_first_available(filename, manifest)
 
     def _build_or_load_cross_map(self, fields, key):
