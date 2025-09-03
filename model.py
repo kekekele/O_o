@@ -77,7 +77,7 @@ class RotaryEmbedding(torch.nn.Module):
         return q, k
 
 
-class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
+class RelativeTimeBias(torch.nn.Module):
     """
     生成两类 bias（logits）：
       - rel_pos_bias: [1, S, S]，仅由相对位置决定（Toeplitz）
@@ -88,11 +88,8 @@ class SeparatedRelativeTimeAndPositionBias(torch.nn.Module):
         self.max_seq_len = max_seq_len
         self.num_buckets = num_buckets
         self.bucketization_fn = bucketization_fn
-        # 可学习参数
         self.ts_w = torch.nn.Parameter(torch.empty(num_buckets + 1).normal_(mean=0.0, std=0.02))
-        # 将 padding 桶(0)的偏置初始化为 0，避免无效位产生无用偏置
-        with torch.no_grad():
-            self.ts_w[0].zero_()
+
 
     def forward(self, timestamps: torch.Tensor, valid_mask: torch.Tensor):
         """
@@ -323,13 +320,13 @@ class BaselineModel(torch.nn.Module):
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
 
         # 相对时间/位置偏置
-        self.rel_time_pos_bias = SeparatedRelativeTimeAndPositionBias(
+        self.rel_time_bias = RelativeTimeBias(
             max_seq_len=args.maxlen + 1,
             num_buckets=128,
             bucketization_fn=lambda x: torch.clamp(
                 (torch.log2(x.clamp(min=1.0)).floor() + 1).long(),  # 1,2,...  (delta=1 -> 1)
                 min=1, max=128
-            )
+            ).detach()
         )
 
         # 绝对时间编码（仍作为 add-on 特征加到序列表示上）
@@ -519,7 +516,7 @@ class BaselineModel(torch.nn.Module):
         )  # [B,S,S]
 
         # 相对时间/位置偏置
-        rel_ts_bias = self.rel_time_pos_bias(ts, key_query_valid)
+        rel_ts_bias = self.rel_time_bias(ts, key_query_valid)
 
         for i in range(len(self.attention_layers)):
             seqs = self.attention_layers[i](

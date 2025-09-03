@@ -28,22 +28,22 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--lr', default=0.0005, type=float)
+    parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--seed', default=20252026, type=int)
 
     # Baseline Model construction
     parser.add_argument('--embedding_dim', default=128, type=int)
-    parser.add_argument('--hidden_units', default=256, type=int)
+    parser.add_argument('--hidden_units', default=512, type=int)
     parser.add_argument('--num_blocks', default=8, type=int)
     parser.add_argument('--num_epochs', default=1, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
 
-    parser.add_argument('--temperature', default=0.05, type=float)
+    parser.add_argument('--temperature', default=0.03, type=float)
     parser.add_argument('--neg_pop_alpha', default=0.15, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
 
@@ -52,7 +52,7 @@ def get_args():
 
     # Torch ANN（新增）
     parser.add_argument('--top_k', default=10, type=int)
-    parser.add_argument('--torch_query_bs', default=None, type=int, help='查询分块大小（默认: cuda=1024, cpu=256）')
+    parser.add_argument('--torch_query_bs', default=4096, type=int, help='查询分块大小（默认: cuda=1024, cpu=256）')
     parser.add_argument('--torch_item_bs', default=None, type=int, help='库向量分块大小（默认: cuda=16384, cpu=8192）')
     parser.add_argument('--use_fp16', default=False, action='store_true', help='在 CUDA 上使用半精度进行相似度计算')
 

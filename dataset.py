@@ -70,6 +70,9 @@ class MyDataset(torch.utils.data.Dataset):
         self.CLICK_BUCKETS = 16
         self.item_click_counts = self._compute_item_click_counts()
         self._click_bucket_map = self._load_click_bucket_map()
+        # 新增：统计 item 出现次数（曝光+点击），并据此保存全局 Q/logQ（供训练端难样本修正）
+        self.item_appear_counts = self._compute_item_appear_counts()
+        self._save_global_item_popularity_from_counts(self.item_appear_counts)
 
         # ========== 新增：按流行度加权负采样的超参与采样器 ==========
         _alpha = getattr(args, "neg_pop_alpha", 0.15)
@@ -259,7 +262,69 @@ class MyDataset(torch.utils.data.Dataset):
                 return cand
         return 0
 
+    def _save_global_item_popularity_from_counts(self, counts: np.ndarray):
+        """
+        用传入的 counts 计算 Q 与 logQ，并保存：
+          - item_pop_q.npy: float32, shape=[itemnum+1]
+          - item_logQ.npy : float32, shape=[itemnum+1]
+        保存优先顺序：USER_CACHE_PATH -> TRAIN_CKPT_PATH -> 数据目录
+        """
+        try:
+            if counts is None or counts.shape[0] != self.itemnum + 1:
+                print("warn: invalid counts for popularity saving. skip.")
+                return
+            total = float(np.sum(counts[1:]))  # 忽略 0 号
+            if not np.isfinite(total) or total <= 0:
+                q = np.zeros(self.itemnum + 1, dtype=np.float32)
+                if self.itemnum > 0:
+                    q[1:] = 1.0 / float(self.itemnum)
+            else:
+                q = counts.astype(np.float64)
+                q[0] = 0.0
+                q = (q / total).astype(np.float32)
+
+            q_safe = np.maximum(q, 1e-12).astype(np.float32)
+            logq = np.log(q_safe, dtype=np.float64).astype(np.float32)
+
+            # 直接覆盖写，确保切到“出现频率”版本
+            for root in self._search_paths_for_cross_files():  # 复用搜索顺序
+                try:
+                    root.mkdir(parents=True, exist_ok=True)
+                    np.save(root / "item_pop_q.npy", q)
+                    np.save(root / "item_logQ.npy", logq)
+                    print(f"Saved item_pop_q.npy & item_logQ.npy -> {root}")
+                    return
+                except Exception as e:
+                    print(f"warn: failed saving Q/logQ to {root}: {e}")
+        except Exception as e:
+            print(f"warn: failed to compute/save global item popularity: {e}")
+
     # ======================== 点击统计与分桶 ========================
+    def _compute_item_appear_counts(self):
+        """
+        统计 item 在训练序列中的出现次数（不区分曝光/点击，只要是有效 item 就 +1）
+        """
+        counts = np.zeros(self.itemnum + 1, dtype=np.int32)
+        prefer = self.data_dir / "seq.jsonl"
+        use_path = prefer if prefer.exists() else self._data_file_path
+        try:
+            with open(use_path, 'rb') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        seq = JSON_LOADS(line)
+                    except Exception:
+                        continue
+                    for rec in seq:
+                        if not isinstance(rec, (list, tuple)) or len(rec) < 6:
+                            continue
+                        i = rec[1]
+                        if isinstance(i, int) and 0 < i <= self.itemnum:
+                            counts[i] += 1
+        except FileNotFoundError:
+            pass
+        return counts
 
     def _compute_item_click_counts(self):
         counts = np.zeros(self.itemnum + 1, dtype=np.int32)
