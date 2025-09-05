@@ -337,30 +337,27 @@ class BaselineModel(torch.nn.Module):
         self.dow_emb = torch.nn.Embedding(7 + 1, args.embedding_dim, padding_idx=0)
         # 1=工作日, 2=周末, 0=pad
         self.weekend_emb = torch.nn.Embedding(2 + 1, args.embedding_dim, padding_idx=0)
+        # 新增：用户侧序列时间跨度特征（log1p 后线性映射到 embedding_dim）
+        self.user_time_span_proj = torch.nn.Linear(1, args.embedding_dim, bias=False)
 
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-
-        self.attention_layernorms = torch.nn.ModuleList()
         self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
 
         self._init_feat_info(feat_statistics, feat_types)
 
         # 计算两条路径的输入维度
-        userdim = args.embedding_dim * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
-            self.USER_CONTINUAL_FEAT
-        )
+        userdim = args.embedding_dim * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + 1) \
+                  + len(self.USER_CONTINUAL_FEAT)
+
         itemdim_for_itemdnn = (
                 args.embedding_dim * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
                 + len(self.ITEM_CONTINUAL_FEAT)
                 + args.embedding_dim * len(self.ITEM_EMB_FEAT)
         )
         # user_item 路径：在原有基础上 + hour/dow/weekend + 交叉特征
-        itemdim_for_user_itemdnn = itemdim_for_itemdnn + 3 * args.embedding_dim + args.embedding_dim * len(
-            self.ITEM_CROSS_FEAT)
+        itemdim_for_user_itemdnn = itemdim_for_itemdnn + 3 * args.embedding_dim + args.embedding_dim * len(self.ITEM_CROSS_FEAT)
         all_dim_for_user_itemdnn = userdim + itemdim_for_user_itemdnn
 
         # 两套编码器：user_item 使用包含时间特征与交叉特征的维度；item 使用原始维度（不含交叉特征）
@@ -454,19 +451,39 @@ class BaselineModel(torch.nn.Module):
         # 将 hour / dow / weekend 作为“item 侧稀疏特征”拼到 user_item 路径
         if include_user and (seq_ts is not None):
             ts = seq_ts.to(self.dev).long()  # [B,S]
-            is_item = (mask == 1).to(self.dev) if mask is not None else torch.ones_like(ts, dtype=torch.bool)
-            hour_idx = ((ts % 86400) // 3600) + 1          # 1..24
-            dow_idx = (((ts // 86400) + 4) % 7) + 1        # 1..7
-            weekend_idx = (dow_idx >= 6).long() + 1        # 1=工作日, 2=周末
-
-            # 仅在 item 位置保留索引，其余位置置 0（embedding 的 padding_idx=0）
-            hour_idx     = torch.where(is_item, hour_idx, torch.zeros_like(hour_idx))
-            dow_idx      = torch.where(is_item,  dow_idx,  torch.zeros_like(dow_idx))
-            weekend_idx  = torch.where(is_item,  weekend_idx, torch.zeros_like(weekend_idx))
-
+            is_item = (mask == 1).to(torch.bool).to(self.dev)
+            hour_idx = ((ts % 86400) // 3600) + 1
+            dow_idx = (((ts // 86400) + 4) % 7) + 1
+            weekend_idx = (dow_idx >= 6).long() + 1
+            hour_idx = torch.where(is_item, hour_idx, torch.zeros_like(hour_idx))
+            dow_idx = torch.where(is_item, dow_idx, torch.zeros_like(dow_idx))
+            weekend_idx = torch.where(is_item, weekend_idx, torch.zeros_like(weekend_idx))
             item_feat_list.append(self.hour_emb(hour_idx))
             item_feat_list.append(self.dow_emb(dow_idx))
             item_feat_list.append(self.weekend_emb(weekend_idx))
+
+            # 新增：序列级“时间跨度”用户特征（最后一个 item ts - 第一个 item ts）
+            valid_item = is_item & (ts > 0)
+            has_any = valid_item.any(dim=1)  # [B]
+
+            INF = torch.iinfo(ts.dtype).max
+            ts_min = torch.where(valid_item, ts, torch.full_like(ts, INF))
+            first_ts = ts_min.min(dim=1).values  # [B]
+            ts_max = torch.where(valid_item, ts, torch.zeros_like(ts))
+            last_ts = ts_max.max(dim=1).values  # [B]
+
+            # 若没有有效 item，则跨度视为 0（first_ts 用 last_ts 兜底）
+            first_ts = torch.where(has_any, first_ts, last_ts)
+            span = (last_ts - first_ts).clamp(min=0).to(torch.float32)  # [B]
+            span_log1p = torch.log1p(span).unsqueeze(-1)  # [B,1]
+
+            # 线性映射到 embedding_dim，并仅在用户位置保留
+            span_emb = self.user_time_span_proj(span_log1p)  # [B,E]
+            span_emb = span_emb.unsqueeze(1).expand(-1, seq.size(1), -1)  # [B,S,E]
+            user_pos_mask = (mask == 2).to(self.dev).unsqueeze(-1).to(span_emb.dtype)  # [B,S,1]
+            span_emb = span_emb * user_pos_mask
+
+            user_feat_list.append(span_emb)
 
         # user 特征（仅在 include_user=True 时使用）
         if include_user:
@@ -490,8 +507,6 @@ class BaselineModel(torch.nn.Module):
         """
         将日志序列（含特征）编码为序列 hidden states
         """
-        batch_size = log_seqs.shape[0]
-        maxlen = log_seqs.shape[1]
 
         # 加入 seq_ts，使 hour/dow/weekend 作为 item 特征进入 user_item_dnn
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, seq_ts=seq_ts)

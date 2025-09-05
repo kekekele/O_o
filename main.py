@@ -41,12 +41,12 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
 
-    parser.add_argument('--temperature', default=0.03, type=float)
-    parser.add_argument('--neg_pop_alpha', default=0.15, type=float)
+    parser.add_argument('--temperature', default=0.025, type=float)
+    parser.add_argument('--neg_pop_alpha', default=0, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
     parser.add_argument('--feature_crosses', nargs='*', default=["118+120", "116+118"],
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
-    parser.add_argument('--hard_neg_k', default=2048, type=int)
+    parser.add_argument('--hard_neg_k', default=4096, type=int)
 
     # AMP: 混合精度训练
     parser.add_argument(
@@ -104,23 +104,21 @@ def InfoNCE(
     next_action_type: torch.Tensor,   # [B, L]，下一个token动作类型，0表示曝光，1表示点击
     click_scale: float = 1.0,
     exp_scale: float = 0.1,
-    # 难样本修正所需
     pos_ids: torch.Tensor = None,     # [B, L] 正样本的 item_id（与 pos_embs 对齐，用于采样难样本）
     item_logQ: torch.Tensor = None,   # [itemnum+1] 的 logQ
     hard_neg_k: int = 1024,           # 难样本数量
     # 仅过滤“当前样本点”的开关
     filter_current_only: bool = True,
-    # 简单负样本池的 id（仅用于当前点过滤）
+    # 简单负样本池的 id（仅用于当前点过滤与 −logQ 修正）
     neg_ids: torch.Tensor = None,     # [B, L] 与 neg_embs 对齐
 ):
     """
-    Batch-all negatives InfoNCE（保持原结构）+ 极简过滤
-    - 仅过滤“当前样本点同 id”的假负样本：
-      * 对主负样本池（batch 内）：屏蔽该行正样本 id == 每列负样本 id 的位置
-      * 对难负样本池：屏蔽 hard_ids == 该行正样本 id 的位置
-    - 不过滤 padding、不使用整段历史，几乎无额外开销。
+    Batch-all negatives InfoNCE + −logQ 修正（pos / batch neg / hard neg 全部修正）。
+    要求：pos_ids、neg_ids、item_logQ 全部有效；item_logQ 建议为 α*logQ 以匹配 Q^α 采样。
     """
     assert temperature > 0.0, "temperature must be > 0"
+    assert item_logQ is not None, "item_logQ is required for -logQ correction"
+    assert pos_ids is not None and neg_ids is not None, "pos_ids and neg_ids are required for -logQ correction"
 
     # 仅对 item 位置计算
     mask = (next_token_type == 1)
@@ -140,13 +138,19 @@ def InfoNCE(
             'mask_rate_easy': 0.0, 'mask_rate_hard': 0.0,
         }
 
-    # 正样本 logit
-    pos_sim    = (Qn * Kpn).sum(dim=-1, keepdim=True)           # [M,1]
-    pos_logits = pos_sim / temperature                          # [M,1]
+    # 对应的 item ids
+    pos_ids_flat = pos_ids[mask].long()   # [M]
+    neg_ids_pool = neg_ids[mask].long()   # [M]
 
-    # 主负样本池 logits
-    neg_sim    = Qn @ Knegn.t()                                 # [M,M]
-    neg_logits = neg_sim / temperature                          # [M,M]
+    # 正样本 logits：sim/T - logQ[pos]
+    pos_sim    = (Qn * Kpn).sum(dim=-1, keepdim=True)                  # [M,1]
+    logQ_pos   = item_logQ[pos_ids_flat].to(device=device, dtype=pos_sim.dtype).unsqueeze(1)  # [M,1]
+    pos_logits = (pos_sim / temperature) - logQ_pos                    # [M,1]
+
+    # 主负样本池 logits：sim/T - logQ[neg_column]
+    neg_sim    = Qn @ Knegn.t()                                        # [M,M]
+    logQ_cols  = item_logQ[neg_ids_pool].to(device=device, dtype=neg_sim.dtype)               # [M]
+    neg_logits = (neg_sim / temperature) - logQ_cols.unsqueeze(0)      # [M,M]
 
     # 点击/曝光样本级别权重
     act_f = act.to(Qn.dtype)
@@ -158,35 +162,29 @@ def InfoNCE(
     # 过滤：仅当前样本点同 id（极小值屏蔽）
     neg_large = torch.tensor(-1e9, device=device, dtype=pos_logits.dtype)
     invalid_easy = torch.zeros((M, M), dtype=torch.bool, device=device)
-
-    if filter_current_only and (pos_ids is not None) and (neg_ids is not None):
-        pos_ids_flat = pos_ids[mask].long()     # [M]
-        neg_ids_pool = neg_ids[mask].long()     # [M]
-        # 行 i 的正 id 与列 j 的负 id 相等即屏蔽
+    if filter_current_only:
         invalid_easy = pos_ids_flat.view(M, 1).eq(neg_ids_pool.view(1, M))
         if invalid_easy.any():
             neg_logits = neg_logits.masked_fill(invalid_easy, neg_large)
 
-    # 难负样本池：采样 + logQ 修正 + 当前点过滤
+    # 难负样本池：采样 + −logQ 修正 + 当前点过滤
     hard_neg_sim = None
     hard_logits = None
     mask_rate_hard = 0.0
 
-    if hard_neg_k > 0 and (pos_ids is not None) and (item_logQ is not None):
+    if hard_neg_k > 0:
         try:
-            pos_ids_flat = pos_ids[mask].long()                 # [M]
             K = min(int(hard_neg_k), M)
             if K > 0:
-                sel = torch.randperm(M, device=device)[:K]      # 不放回
-                hard_embs = Kpn[sel]                             # [K, D]
-                hard_ids  = pos_ids_flat[sel]                    # [K]
-                logQ_cols = item_logQ[hard_ids].to(device=device, dtype=torch.float32)  # [K]
+                sel = torch.randperm(M, device=device)[:K]          # 不放回
+                hard_embs = Kpn[sel]                                 # [K, D]
+                hard_ids  = pos_ids_flat[sel]                        # [K]
+                logQ_hard = item_logQ[hard_ids].to(device=device, dtype=pos_logits.dtype)  # [K]
 
-                hard_neg_sim = Qn @ hard_embs.t()                # [M,K]
-                hard_logits = (hard_neg_sim / temperature) - logQ_cols.unsqueeze(0)  # [M,K]
+                hard_neg_sim = Qn @ hard_embs.t()                    # [M,K]
+                hard_logits  = (hard_neg_sim / temperature) - logQ_hard.unsqueeze(0)       # [M,K]
 
                 if filter_current_only:
-                    # 行 i 的正 id 与列 j 的 hard id 相等即屏蔽
                     invalid_hard = pos_ids_flat.view(M, 1).eq(hard_ids.view(1, K))
                     if invalid_hard.any():
                         hard_logits = hard_logits.masked_fill(invalid_hard, neg_large)
@@ -217,7 +215,7 @@ def InfoNCE(
 def _load_item_logQ_for_train(dataset, device: torch.device):
     """
     优先从 USER_CACHE_PATH / TRAIN_CKPT_PATH / 数据目录 读取 item_logQ.npy；
-    若不存在则基于 dataset.item_click_counts 即时计算并尝试保存。
+    若不存在则基于 dataset.item_appear_counts（曝光+点击）即时计算并尝试保存。
     返回：torch.float32[ itemnum+1 ]（在 device 上）
     """
     candidates = []
@@ -241,8 +239,8 @@ def _load_item_logQ_for_train(dataset, device: torch.device):
             print(f"warn: failed loading item_logQ.npy from {p}: {e}")
 
     if logq_np is None:
-        # 即时计算
-        counts = getattr(dataset, "item_click_counts", None)
+        # 即时计算：使用“出现次数”
+        counts = getattr(dataset, "item_appear_counts", None)
         itemnum = getattr(dataset, "itemnum", 0)
         if counts is None or itemnum <= 0:
             # 退化

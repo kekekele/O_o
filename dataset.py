@@ -72,7 +72,7 @@ class MyDataset(torch.utils.data.Dataset):
         self._click_bucket_map = self._load_click_bucket_map()
         # 新增：统计 item 出现次数（曝光+点击），并据此保存全局 Q/logQ（供训练端难样本修正）
         self.item_appear_counts = self._compute_item_appear_counts()
-        self._save_global_item_popularity_from_counts(self.item_appear_counts)
+        self._ensure_global_item_popularity()
 
         # ========== 新增：按流行度加权负采样的超参与采样器 ==========
         _alpha = getattr(args, "neg_pop_alpha", 0.15)
@@ -188,7 +188,7 @@ class MyDataset(torch.utils.data.Dataset):
     # ---------------------- 采样与统计 ----------------------
     def _build_popularity_sampler(self):
         """
-        基于 item_click_counts 构建按流行度加权的采样 CDF。
+        基于 item_appear_counts（曝光+点击）构建按流行度加权的采样 CDF。
         采样空间限定为合法 item（valid_item_ids ∩ (0, itemnum]）。
         权重：w_i = max(count_i, min_count) ** alpha
         """
@@ -207,8 +207,12 @@ class MyDataset(torch.utils.data.Dataset):
                 self._neg_sample_cdf = np.asarray([], dtype=np.float64)
                 return
 
-            counts = self.item_click_counts[ids] if hasattr(self, 'item_click_counts') else np.zeros_like(ids,
-                                                                                                          dtype=np.int32)
+            # 使用“出现次数”作为流行度来源（替换点击次数）
+            counts = (
+                self.item_appear_counts[ids]
+                if hasattr(self, 'item_appear_counts') else
+                np.zeros_like(ids, dtype=np.int32)
+            )
             counts = np.maximum(counts, int(self.neg_pop_min_count)).astype(np.float64)
 
             alpha = float(self.neg_pop_alpha)
@@ -262,6 +266,72 @@ class MyDataset(torch.utils.data.Dataset):
                 return cand
         return 0
 
+    def _load_global_item_popularity(self):
+        """
+        按 USER_CACHE_PATH -> TRAIN_CKPT_PATH -> 数据目录 的优先级加载
+        item_pop_q.npy 与 item_logQ.npy。
+        要求两者 shape == [itemnum+1]；若仅有 q 则补算 logQ 并落盘。
+        返回 (q, logq) 或 (None, None)
+        """
+        for root in self._search_paths_for_cross_files():
+            try:
+                p_q = root / "item_pop_q.npy"
+                p_lq = root / "item_logQ.npy"
+                has_q = p_q.exists()
+                has_lq = p_lq.exists()
+                if not has_q and not has_lq:
+                    continue
+
+                if has_q:
+                    q = np.load(p_q)
+                    if q.shape[0] != self.itemnum + 1:
+                        print(f"warn: {p_q} shape={q.shape} != itemnum+1={self.itemnum + 1}, skip.")
+                        continue
+
+                    logq = None
+                    if has_lq:
+                        logq = np.load(p_lq)
+                        if logq.shape[0] != self.itemnum + 1:
+                            print(
+                                f"warn: {p_lq} shape={logq.shape} != itemnum+1={self.itemnum + 1}, will recompute logQ.")
+                            logq = None
+
+                    if logq is None:
+                        logq = np.log(np.maximum(q.astype(np.float64), 1e-12)).astype(np.float32)
+                        try:
+                            np.save(p_lq, logq)
+                            print(f"Generated item_logQ.npy -> {p_lq}")
+                        except Exception as e:
+                            print(f"warn: failed to save generated logQ to {p_lq}: {e}")
+
+                    print(f"Loaded item_pop_q.npy/logQ from {root}")
+                    return q.astype(np.float32), logq.astype(np.float32)
+                else:
+                    # 仅存在 logQ 无法可靠恢复 q，跳过
+                    print(f"warn: found {p_lq} without item_pop_q.npy at {root}, skip.")
+            except Exception as e:
+                print(f"warn: reading Q/logQ from {root} failed: {e}")
+        return None, None
+
+    def _ensure_global_item_popularity(self):
+        """
+        若已存在 Q/logQ 且形状匹配则直接加载；否则基于出现次数重建并写出，然后再加载到内存。
+        """
+        q, logq = self._load_global_item_popularity()
+        if q is not None and logq is not None:
+            self.item_pop_q = q
+            self.item_logQ = logq
+            return
+
+        # 不存在或不匹配：重建并写出
+        self._save_global_item_popularity_from_counts(self.item_appear_counts)
+
+        # 重建后再加载进内存，方便其它模块直接使用
+        q, logq = self._load_global_item_popularity()
+        if q is not None and logq is not None:
+            self.item_pop_q = q
+            self.item_logQ = logq
+
     def _save_global_item_popularity_from_counts(self, counts: np.ndarray):
         """
         用传入的 counts 计算 Q 与 logQ，并保存：
@@ -284,7 +354,7 @@ class MyDataset(torch.utils.data.Dataset):
                 q = (q / total).astype(np.float32)
 
             q_safe = np.maximum(q, 1e-12).astype(np.float32)
-            logq = np.log(q_safe, dtype=np.float64).astype(np.float32)
+            logq = np.log(q_safe.astype(np.float64)).astype(np.float32)
 
             # 直接覆盖写，确保切到“出现频率”版本
             for root in self._search_paths_for_cross_files():  # 复用搜索顺序
