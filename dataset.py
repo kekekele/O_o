@@ -32,6 +32,10 @@ class MyDataset(torch.utils.data.Dataset):
           * feature_cross_manifest.json
           * item_cross_<x...>_map.json
       - 推理期（TestDataset）优先加载上述文件，保证一致
+
+    额外支持（本实现新增）：
+      - 自监督增广（RFM_no_compl）：在 __getitem__ 中为“负样本特征”生成两条增强视图
+        neg_feat_ssl1 / neg_feat_ssl2，并在 collate_fn 中张量化返回。
     """
 
     # ---------------------- 构造与加载 ----------------------
@@ -86,7 +90,7 @@ class MyDataset(torch.utils.data.Dataset):
         self._build_popularity_sampler()
 
         # ========== 特征组合：解析配置 -> (fields, key) 列表 ==========
-        self.cross_specs = self._get_cross_specs(args)  # list[{'fields': [...], 'key': 'x100_101', 'size': int}]
+        self.cross_specs = self._get_cross_specs(args)  # list[{'fields': [...], 'key': 'x...'}]
         # 构建/加载各组合的映射表（fields 值串为 "v1_v2_..." -> id）
         self.cross_maps = {}
         for spec in self.cross_specs:
@@ -113,6 +117,12 @@ class MyDataset(torch.utils.data.Dataset):
         self._build_feat_templates()
         self._item_feat_cache = OrderedDict()
         self._item_feat_cache_max = 400000  # 可根据内存调节
+
+        # ===== 自监督（RFM_no_compl）配置（由 main 传入，仅训练集使用）=====
+        self.ssl_mode = getattr(args, "ssl", "none")            # 'none' or 'rfm_no_compl'
+        self.ssl_alpha = float(getattr(args, "ssl_alpha", 0.0))
+        self.ssl_mask_ratio = float(getattr(args, "ssl_mask_ratio", 0.5))
+        self.ssl_value_dropout = float(getattr(args, "ssl_value_dropout", 0.3))
 
     def _normalize_feature_crosses(self, raw):
         """
@@ -151,7 +161,7 @@ class MyDataset(torch.utils.data.Dataset):
             specs.append({"fields": list(fields), "key": key})
             sig_parts.append(key)
 
-        norm_sig = "__".join(sig_parts) if sig_parts else None
+        norm_sig = "__" .join(sig_parts) if sig_parts else None
         return norm_sig, specs
 
     def _load_data_and_offsets(self):
@@ -236,13 +246,13 @@ class MyDataset(torch.utils.data.Dataset):
         """
         从 CDF 中按权重采样一个 item_id
         """
-        if getattr(self, "_neg_sample_ids", None) is None or self._neg_sample_ids.size == 0:
-            return 0
-        r = np.random.random()
-        idx = int(np.searchsorted(self._neg_sample_cdf, r, side="right"))
-        if idx >= self._neg_sample_ids.size:
-            idx = self._neg_sample_ids.size - 1
-        return int(self._neg_sample_ids[idx])
+        if getattr(self, "_neg_sample_ids", None) is not None and self._neg_sample_ids.size > 0:
+            r = np.random.random()
+            idx = int(np.searchsorted(self._neg_sample_cdf, r, side="right"))
+            if idx >= self._neg_sample_ids.size:
+                idx = self._neg_sample_ids.size - 1
+            return int(self._neg_sample_ids[idx])
+        return 0
 
     def _random_neq(self, hist_set):
         """
@@ -568,7 +578,7 @@ class MyDataset(torch.utils.data.Dataset):
         # 统一生成/获取文件名
         filename = getattr(self, "_manifest_filename", None)
         if not filename:
-            sig = "__".join(sorted([self._cross_key_from_fields(s["fields"]) for s in specs]))
+            sig = "__" .join(sorted([self._cross_key_from_fields(s["fields"]) for s in specs]))
             filename = f"feature_cross_manifest__{sig}.json"
             self._manifest_filename = filename
         # 若任一候选路径已存在，直接复用并跳过保存
@@ -621,6 +631,62 @@ class MyDataset(torch.utils.data.Dataset):
         print(f"[cross] built {key}: unique={len(mapping)}")
         return mapping
 
+    # ---------------------- 自监督增广（RFM_no_compl，用于负样本） ----------------------
+    def _rfm_no_compl_two_views_on_item_feat(self, base_feat: dict, allow_id_mask: bool = False):
+        """
+        对单个 item 特征字典 base_feat 生成两条 RFM_no_compl 视图：
+          - 域级掩蔽：在 {item_sparse, item_array} 中随机选取比例 mask_ratio 的字段置为默认值
+          - （可选）把“item id”视作一个可掩蔽域：若被采中则将该视图的 id 置为 0（padding）
+          - 值级 dropout：对 item_array 的“值”按概率置 0
+        返回: (view1_dict, view2_dict, mask_id1: bool, mask_id2: bool)
+        """
+        item_sparse_fids = list(self.feature_types.get('item_sparse', []))
+        item_array_fids = list(self.feature_types.get('item_array', []))
+        candidates = item_sparse_fids + item_array_fids
+        ID_SENTINEL = '__ID__'
+        if allow_id_mask:
+            candidates.append(ID_SENTINEL)
+
+        K = len(candidates)
+
+        def _make_view(mask_set: set):
+            view = dict(base_feat)
+            # 1) 域级掩蔽
+            for fid in mask_set:
+                if fid == ID_SENTINEL:
+                    continue
+                if fid in view:
+                    dv = self.feature_default_value.get(fid, 0)
+                    view[fid] = (dv.copy() if isinstance(dv, np.ndarray)
+                                 else (list(dv) if isinstance(dv, list) else dv))
+            # 2) 值级 dropout（item_array）
+            p = float(self.ssl_value_dropout)
+            if p > 0.0:
+                for fid in item_array_fids:
+                    if fid in view and isinstance(view[fid], list) and len(view[fid]) > 0:
+                        arr = view[fid]
+                        for i in range(len(arr)):
+                            if np.random.random() < p:
+                                arr[i] = 0
+                        view[fid] = arr
+            return view
+
+        if K <= 0:
+            mask1 = set();
+            mask2 = set()
+        else:
+            m = max(1, min(K, int(round(self.ssl_mask_ratio * K))))
+            idx1 = np.random.choice(np.arange(K), size=m, replace=False)
+            idx2 = np.random.choice(np.arange(K), size=m, replace=False)
+            mask1 = set(candidates[i] for i in idx1)
+            mask2 = set(candidates[i] for i in idx2)
+
+        v1 = _make_view(mask1)
+        v2 = _make_view(mask2)
+        mask_id1 = (ID_SENTINEL in mask1)
+        mask_id2 = (ID_SENTINEL in mask2)
+        return v1, v2, mask_id1, mask_id2
+
     # ---------------------- 核心数据流程 ----------------------
 
     def __getitem__(self, uid):
@@ -656,6 +722,8 @@ class MyDataset(torch.utils.data.Dataset):
         next_token_type = np.zeros([S], dtype=np.int32)
         next_action_type = np.zeros([S], dtype=np.int32)
         seq_ts = np.zeros([S], dtype=np.int64)
+        neg_ssl1 = np.zeros([S], dtype=np.int32)
+        neg_ssl2 = np.zeros([S], dtype=np.int32)
 
         # 预填全量默认字典
         seq_feat = np.empty([S], dtype=object)
@@ -664,6 +732,10 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat.fill(self.feature_default_value)
         pos_feat.fill(self.feature_default_value)
         neg_feat.fill(self.feature_default_value)
+
+        # 新增：两条负样本 SSL 视图
+        neg_feat_ssl1 = np.empty([S], dtype=object); neg_feat_ssl1.fill(self.feature_default_value)
+        neg_feat_ssl2 = np.empty([S], dtype=object); neg_feat_ssl2.fill(self.feature_default_value)
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
@@ -689,31 +761,63 @@ class MyDataset(torch.utils.data.Dataset):
             seq_ts[idx] = int(ts_cur) if ts_cur is not None else 0
 
             if next_type == 1 and next_i != 0:
+                # 正样本
                 pos[idx] = next_i
                 pos_feat[idx] = self._make_item_feat(next_i, next_feat_raw)
+                # 负样本
                 neg_id = self._random_neq(item_ids_in_hist)
                 neg[idx] = neg_id
                 neg_raw = self.item_feat_dict.get(neg_id, {})
-                neg_feat[idx] = self._make_item_feat(neg_id, neg_raw)
+                base_neg_feat = self._make_item_feat(neg_id, neg_raw)
+                neg_feat[idx] = base_neg_feat
+
+                # ===== 新增：对负样本做 RFM_no_compl 两视图，并可掩蔽 item id =====
+                if (self.ssl_mode == 'rfm_no_compl') and (self.ssl_alpha > 0.0):
+                    v1, v2, mid1, mid2 = self._rfm_no_compl_two_views_on_item_feat(
+                        base_neg_feat, allow_id_mask=True
+                    )
+                    neg_feat_ssl1[idx] = v1
+                    neg_feat_ssl2[idx] = v2
+                    neg_ssl1[idx] = 0 if mid1 else neg_id
+                    neg_ssl2[idx] = 0 if mid2 else neg_id
+                else:
+                    neg_feat_ssl1[idx] = base_neg_feat
+                    neg_feat_ssl2[idx] = base_neg_feat
+                    neg_ssl1[idx] = neg_id
+                    neg_ssl2[idx] = neg_id
 
             nxt = record_tuple
             idx -= 1
             if idx == -1:
                 break
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
+        return (seq, pos, neg, token_type, next_token_type, next_action_type,
+                seq_feat, pos_feat, neg_feat, seq_ts, neg_feat_ssl1, neg_feat_ssl2,
+                neg_ssl1, neg_ssl2)
 
     def _empty_return(self):
         S = self.maxlen + 1
         zeros_i32 = np.zeros([S], dtype=np.int32)
         zeros_i64 = np.zeros([S], dtype=np.int64)
-        seq_feat = np.empty([S], dtype=object); seq_feat.fill(self.feature_default_value)
-        pos_feat = np.empty([S], dtype=object); pos_feat.fill(self.feature_default_value)
-        neg_feat = np.empty([S], dtype=object); neg_feat.fill(self.feature_default_value)
+        seq_feat = np.empty([S], dtype=object);
+        seq_feat.fill(self.feature_default_value)
+        pos_feat = np.empty([S], dtype=object);
+        pos_feat.fill(self.feature_default_value)
+        neg_feat = np.empty([S], dtype=object);
+        neg_feat.fill(self.feature_default_value)
+        neg_feat_ssl1 = np.empty([S], dtype=object);
+        neg_feat_ssl1.fill(self.feature_default_value)
+        neg_feat_ssl2 = np.empty([S], dtype=object);
+        neg_feat_ssl2.fill(self.feature_default_value)
         token_type = zeros_i32.copy()
         next_token_type = zeros_i32.copy()
         next_action_type = zeros_i32.copy()
-        return zeros_i32, zeros_i32.copy(), zeros_i32.copy(), token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, zeros_i64
+        neg_ssl1 = zeros_i32.copy()
+        neg_ssl2 = zeros_i32.copy()
+        return (zeros_i32, zeros_i32.copy(), zeros_i32.copy(),
+                token_type, next_token_type, next_action_type,
+                seq_feat, pos_feat, neg_feat, zeros_i64,
+                neg_feat_ssl1, neg_feat_ssl2, neg_ssl1, neg_ssl2)
 
     def __len__(self):
         return len(self.seq_offsets)
@@ -1043,9 +1147,12 @@ class MyDataset(torch.utils.data.Dataset):
             pos_feat: 预张量化的正样本特征字典
             neg_feat: 预张量化的负样本特征字典
             seq_ts: 与 seq 对齐的时间戳, torch.LongTensor [B, S]
+            neg_feat_ssl1: 负样本增强视图1
+            neg_feat_ssl2: 负样本增强视图2
         """
         (seq, pos, neg, token_type, next_token_type, next_action_type,
-         seq_feat, pos_feat, neg_feat, seq_ts) = zip(*batch)
+         seq_feat, pos_feat, neg_feat, seq_ts, neg_feat_ssl1, neg_feat_ssl2,
+         neg_ssl1, neg_ssl2) = zip(*batch)
 
         # 先全部保持在 NumPy
         seq_np = np.stack(seq)
@@ -1055,6 +1162,8 @@ class MyDataset(torch.utils.data.Dataset):
         ntt_np = np.stack(next_token_type)
         nat_np = np.stack(next_action_type)
         ts_np = np.stack(seq_ts)
+        neg_ssl1_np = np.stack(neg_ssl1)
+        neg_ssl2_np = np.stack(neg_ssl2)
 
         # 向量化：直接传 NumPy，避免 tensor.numpy() 往返
         seq_feat = self._tensorize_feature_list(
@@ -1070,6 +1179,15 @@ class MyDataset(torch.utils.data.Dataset):
             list(neg_feat), ids=neg_np,
             groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
         )
+        # 新增：两条负样本 SSL 视图
+        neg_feat_ssl1 = self._tensorize_feature_list(
+            list(neg_feat_ssl1), ids=neg_ssl1_np,
+            groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
+        )
+        neg_feat_ssl2 = self._tensorize_feature_list(
+            list(neg_feat_ssl2), ids=neg_ssl2_np,
+            groups=['item_sparse', 'item_array', 'item_continual', 'item_emb']
+        )
 
         # 再一次性转成 Torch
         seq = torch.from_numpy(seq_np).long()
@@ -1079,8 +1197,12 @@ class MyDataset(torch.utils.data.Dataset):
         next_token_type = torch.from_numpy(ntt_np).long()
         next_action_type = torch.from_numpy(nat_np).long()
         seq_ts = torch.from_numpy(ts_np).long()
+        neg_ssl1 = torch.from_numpy(neg_ssl1_np).long()
+        neg_ssl2 = torch.from_numpy(neg_ssl2_np).long()
 
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
+        return (seq, pos, neg, token_type, next_token_type, next_action_type,
+                seq_feat, pos_feat, neg_feat, seq_ts, neg_feat_ssl1, neg_feat_ssl2,
+                neg_ssl1, neg_ssl2)
 
 
 class MyTestDataset(MyDataset):
@@ -1249,40 +1371,3 @@ def load_mm_emb(mm_path, feat_ids, indexer_i, itemnum):
         dicts[feat_id] = dct
         print(f'Loaded #{feat_id} mm_emb')
     return mats, dicts
-
-
-# def load_mm_emb(mm_path, feat_ids, indexer_i, itemnum):
-#     """
-#     加载多模态特征Embedding：
-#       - 返回致密矩阵（feat_id -> np.ndarray[itemnum+1, dim]）
-#       - 同时返回按 creative_id(raw) 索引的字典（feat_id -> {raw_id: np.ndarray[dim]}}）
-#     """
-#     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-#     mats = {}
-#     dicts = {}
-#     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
-#         dim = SHAPE_DICT[feat_id]
-#         mat = np.zeros((itemnum + 1, dim), dtype=np.float32)  # 0 行作为缺省
-#         dct = {}
-#
-#         # if feat_id != '81':
-#         try:
-#             base_path = Path(mm_path, f'emb_{feat_id}_{dim}')
-#             # for json_file in base_path.glob('*.json'):
-#             for json_file in base_path.glob('part-*'):
-#                 with open(json_file, 'rb') as file:
-#                     for line in file:
-#                         data_dict_origin = JSON_LOADS(line.strip())
-#                         raw_id = data_dict_origin['anonymous_cid']
-#                         vec = np.asarray(data_dict_origin['emb'], dtype=np.float32)
-#                         dct[raw_id] = vec
-#                         reid = indexer_i.get(raw_id, None)
-#                         if reid is not None and 0 <= reid <= itemnum:
-#                             mat[reid] = vec
-#         except Exception as e:
-#             print(f"transfer error: {e}")
-#
-#         mats[feat_id] = mat
-#         dicts[feat_id] = dct
-#         print(f'Loaded #{feat_id} mm_emb')
-#     return mats, dicts

@@ -46,18 +46,20 @@ def get_args():
     parser.add_argument('--weight_decay', default=0.0001, type=float)
     parser.add_argument('--feature_crosses', nargs='*', default=["118+120", "116+118"],
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
-    parser.add_argument('--hard_neg_k', default=4096, type=int)
 
     # AMP: 混合精度训练
-    parser.add_argument(
-        '--amp',
-        default='auto',
+    parser.add_argument('--amp', default='auto',
         choices=['off', 'fp16', 'bf16', 'auto'],
         help='混合精度模式：off 关闭；fp16 半精度；bf16 bfloat16；auto 优先 bf16，不支持则回退 fp16'
     )
-
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+
+    # ==================== 自监督（由 dataset 进行增广，这里只做损失） ====================
+    parser.add_argument('--ssl', default='rfm_no_compl', choices=['none', 'rfm_no_compl'], help='自监督增广方式（dataset 内实现）；none 关闭')
+    parser.add_argument('--ssl_alpha', default=0.5, type=float, help='SSL 损失权重alpha')
+    parser.add_argument('--ssl_mask_ratio', default=0.5, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
+    parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
 
     args = parser.parse_args()
     return args
@@ -104,17 +106,15 @@ def InfoNCE(
     next_action_type: torch.Tensor,   # [B, L]，下一个token动作类型，0表示曝光，1表示点击
     click_scale: float = 1.0,
     exp_scale: float = 0.1,
-    pos_ids: torch.Tensor = None,     # [B, L] 正样本的 item_id（与 pos_embs 对齐，用于采样难样本）
+    pos_ids: torch.Tensor = None,     # [B, L] 正样本的 item_id（与 pos_embs 对齐，用于 -logQ 修正）
     item_logQ: torch.Tensor = None,   # [itemnum+1] 的 logQ
-    hard_neg_k: int = 1024,           # 难样本数量
-    # 仅过滤“当前样本点”的开关
     filter_current_only: bool = True,
-    # 简单负样本池的 id（仅用于当前点过滤与 −logQ 修正）
     neg_ids: torch.Tensor = None,     # [B, L] 与 neg_embs 对齐
 ):
     """
-    Batch-all negatives InfoNCE + −logQ 修正（pos / batch neg / hard neg 全部修正）。
-    要求：pos_ids、neg_ids、item_logQ 全部有效；item_logQ 建议为 α*logQ 以匹配 Q^α 采样。
+    Batch-all negatives InfoNCE + −logQ 修正。
+    变更：不再对子采样难负样本；难负样本=“全 batch 内除本序列以外的所有正样本”。
+    要求：pos_ids、neg_ids、item_logQ 均有效；item_logQ 建议为 α*logQ 以匹配 Q^α 采样。
     """
     assert temperature > 0.0, "temperature must be > 0"
     assert item_logQ is not None, "item_logQ is required for -logQ correction"
@@ -147,7 +147,7 @@ def InfoNCE(
     logQ_pos   = item_logQ[pos_ids_flat].to(device=device, dtype=pos_sim.dtype).unsqueeze(1)  # [M,1]
     pos_logits = (pos_sim / temperature) - logQ_pos                    # [M,1]
 
-    # 主负样本池 logits：sim/T - logQ[neg_column]
+    # 批内“易负样本”池 logits：sim/T - logQ[neg_column]
     neg_sim    = Qn @ Knegn.t()                                        # [M,M]
     logQ_cols  = item_logQ[neg_ids_pool].to(device=device, dtype=neg_sim.dtype)               # [M]
     neg_logits = (neg_sim / temperature) - logQ_cols.unsqueeze(0)      # [M,M]
@@ -159,7 +159,7 @@ def InfoNCE(
     )  # [M]
     sample_weight = sample_weight / sample_weight.sum().clamp_min(1e-12)
 
-    # 过滤：仅当前样本点同 id（极小值屏蔽）
+    # 过滤“易负样本”：同 id 屏蔽
     neg_large = torch.tensor(-1e9, device=device, dtype=pos_logits.dtype)
     invalid_easy = torch.zeros((M, M), dtype=torch.bool, device=device)
     if filter_current_only:
@@ -167,109 +167,60 @@ def InfoNCE(
         if invalid_easy.any():
             neg_logits = neg_logits.masked_fill(invalid_easy, neg_large)
 
-    # 难负样本池：采样 + −logQ 修正 + 当前点过滤
-    hard_neg_sim = None
-    hard_logits = None
-    mask_rate_hard = 0.0
+    # ==================== 全量“难负样本”= 其他序列的正样本 ====================
+    # 找到每个被计算位置对应的 batch 序列索引（第 0 维）
+    idxs = mask.nonzero(as_tuple=False)    # [M, 2], 每行=(b, l)
+    seq_idx = idxs[:, 0]                   # [M]
 
-    if hard_neg_k > 0:
-        try:
-            K = min(int(hard_neg_k), M)
-            if K > 0:
-                sel = torch.randperm(M, device=device)[:K]          # 不放回
-                hard_embs = Kpn[sel]                                 # [K, D]
-                hard_ids  = pos_ids_flat[sel]                        # [K]
-                logQ_hard = item_logQ[hard_ids].to(device=device, dtype=pos_logits.dtype)  # [K]
+    # 构造全量难负样本矩阵，并做 −logQ 修正（按列对应正样本 id）
+    hard_neg_sim_full = Qn @ Kpn.t()       # [M,M]
+    logQ_hard_cols = item_logQ[pos_ids_flat].to(device=device, dtype=hard_neg_sim_full.dtype)  # [M]
+    hard_logits = (hard_neg_sim_full / temperature) - logQ_hard_cols.unsqueeze(0)              # [M,M]
 
-                hard_neg_sim = Qn @ hard_embs.t()                    # [M,K]
-                hard_logits  = (hard_neg_sim / temperature) - logQ_hard.unsqueeze(0)       # [M,K]
+    # 屏蔽“同一序列”的列（包含自身），仅保留其他序列的正样本为难负
+    invalid_hard = seq_idx.view(M, 1).eq(seq_idx.view(1, M))  # True 表示需屏蔽
+    if invalid_hard.any():
+        hard_logits = hard_logits.masked_fill(invalid_hard, neg_large)
+    mask_rate_hard = float(invalid_hard.float().mean().item())
 
-                if filter_current_only:
-                    invalid_hard = pos_ids_flat.view(M, 1).eq(hard_ids.view(1, K))
-                    if invalid_hard.any():
-                        hard_logits = hard_logits.masked_fill(invalid_hard, neg_large)
-                    mask_rate_hard = float(invalid_hard.float().mean().item())
-        except Exception as e:
-            print(f"warn: building hard negatives failed: {e}")
-
-    # 拼接分母
-    if hard_logits is not None:
-        logits = torch.cat([pos_logits, neg_logits, hard_logits], dim=1)  # [M, 1+M+K]
-    else:
-        logits = torch.cat([pos_logits, neg_logits], dim=1)               # [M, 1+M]
+    # 拼接分母：正样本 + 易负样本 + 难负样本（全量）
+    logits = torch.cat([pos_logits, neg_logits, hard_logits], dim=1)  # [M, 1+M+M]
     labels = torch.zeros(M, dtype=torch.long, device=device)
 
     # 损失
     per_example_loss = F.cross_entropy(logits, labels, reduction='none')  # [M]
     loss = (per_example_loss * sample_weight).sum()
 
+    # 统计：难负样本仅统计未屏蔽对
+    if (~invalid_hard).any():
+        mean_hard_neg_sim = float(hard_neg_sim_full[~invalid_hard].mean().item())
+    else:
+        mean_hard_neg_sim = 0.0
+
     stats = {
         'mean_pos_sim': float(pos_sim.mean().item()),
         'mean_neg_sim': float(neg_sim.mean().item()),
-        'mean_hard_neg_sim': float(hard_neg_sim.mean().item()) if hard_neg_sim is not None else 0.0,
+        'mean_hard_neg_sim': mean_hard_neg_sim,
         'mask_rate_easy': float(invalid_easy.float().mean().item()),
         'mask_rate_hard': mask_rate_hard,
     }
     return loss, stats
 
-def _load_item_logQ_for_train(dataset, device: torch.device):
-    """
-    优先从 USER_CACHE_PATH / TRAIN_CKPT_PATH / 数据目录 读取 item_logQ.npy；
-    若不存在则基于 dataset.item_appear_counts（曝光+点击）即时计算并尝试保存。
-    返回：torch.float32[ itemnum+1 ]（在 device 上）
-    """
-    candidates = []
-    for k in ["USER_CACHE_PATH", "TRAIN_CKPT_PATH", "TRAIN_DATA_PATH"]:
-        v = os.environ.get(k, None)
-        if v:
-            candidates.append(Path(v) / "item_logQ.npy")
-    # 数据目录兜底
-    data_dir = getattr(dataset, "data_dir", None)
-    if data_dir is not None:
-        candidates.append(Path(data_dir) / "item_logQ.npy")
 
-    logq_np = None
-    for p in candidates:
-        try:
-            if p.exists():
-                logq_np = np.load(p)
-                print(f"Loaded item_logQ.npy from {p}")
-                break
-        except Exception as e:
-            print(f"warn: failed loading item_logQ.npy from {p}: {e}")
+def ssl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
+    assert temperature > 0.0
+    if z1.numel() == 0 or z2.numel() == 0:
+        return torch.zeros((), device=z1.device)
+    z1 = F.normalize(z1, dim=-1)
+    z2 = F.normalize(z2, dim=-1)
+    M = z1.size(0)
+    logits12 = (z1 @ z2.t()) / float(temperature)
+    labels = torch.arange(M, device=z1.device)
+    loss12 = F.cross_entropy(logits12.float(), labels, reduction='mean')
+    logits21 = (z2 @ z1.t()) / float(temperature)
+    loss21 = F.cross_entropy(logits21.float(), labels, reduction='mean')
+    return 0.5 * (loss12 + loss21)
 
-    if logq_np is None:
-        # 即时计算：使用“出现次数”
-        counts = getattr(dataset, "item_appear_counts", None)
-        itemnum = getattr(dataset, "itemnum", 0)
-        if counts is None or itemnum <= 0:
-            # 退化
-            logq_np = np.full(itemnum + 1, -np.log(max(itemnum, 1.0)), dtype=np.float32)
-            logq_np[0] = -1e9
-        else:
-            counts = np.asarray(counts)
-            total = float(np.sum(counts[1:]))
-            if not np.isfinite(total) or total <= 0:
-                q = np.zeros(itemnum + 1, dtype=np.float32)
-                if itemnum > 0:
-                    q[1:] = 1.0 / float(itemnum)
-            else:
-                q = counts.astype(np.float64)
-                q[0] = 0.0
-                q = (q / total).astype(np.float32)
-            q = np.maximum(q, 1e-12)
-            logq_np = np.log(q, dtype=np.float64).astype(np.float32)
-        # 尝试写回缓存（不强制）
-        try:
-            cache_root = os.environ.get("USER_CACHE_PATH", None)
-            if cache_root:
-                Path(cache_root).mkdir(parents=True, exist_ok=True)
-                np.save(Path(cache_root) / "item_logQ.npy", logq_np)
-                print(f"Saved item_logQ.npy -> {Path(cache_root) / 'item_logQ.npy'}")
-        except Exception as e:
-            print(f"warn: failed saving item_logQ.npy: {e}")
-
-    return torch.from_numpy(logq_np).to(device=device, dtype=torch.float32)
 
 @torch.no_grad()
 def evaluate_acc1(model, valid_loader, device, amp_enabled: bool, amp_dtype):
@@ -283,8 +234,12 @@ def evaluate_acc1(model, valid_loader, device, amp_enabled: bool, amp_dtype):
     correct = 0
 
     for batch in valid_loader:
-        (seq, pos, neg, token_type, next_token_type, next_action_type,
-         seq_feat, pos_feat, neg_feat, seq_ts) = batch
+        # 兼容包含 SSL 视图的 batch（训练集 collate_fn 返回 12 个元素）
+        if isinstance(batch, (list, tuple)) and len(batch) >= 10:
+            (seq, pos, neg, token_type, next_token_type, next_action_type,
+             seq_feat, pos_feat, neg_feat, seq_ts) = batch[:10]
+        else:
+            continue
 
         seq = seq.to(device)
         pos = pos.to(device)
@@ -448,6 +403,65 @@ if __name__ == '__main__':
 
     # 加载全局 logQ（供难样本修正）
     device_t = torch.device(args.device)
+    def _load_item_logQ_for_train(dataset, device: torch.device):
+        """
+        优先从 USER_CACHE_PATH / TRAIN_CKPT_PATH / 数据目录 读取 item_logQ.npy；
+        若不存在则基于 dataset.item_appear_counts（曝光+点击）即时计算并尝试保存。
+        返回：torch.float32[ itemnum+1 ]（在 device 上）
+        """
+        candidates = []
+        for k in ["USER_CACHE_PATH", "TRAIN_CKPT_PATH", "TRAIN_DATA_PATH"]:
+            v = os.environ.get(k, None)
+            if v:
+                candidates.append(Path(v) / "item_logQ.npy")
+        # 数据目录兜底
+        data_dir = getattr(dataset, "data_dir", None)
+        if data_dir is not None:
+            candidates.append(Path(data_dir) / "item_logQ.npy")
+
+        logq_np = None
+        for p in candidates:
+            try:
+                if p.exists():
+                    logq_np = np.load(p)
+                    print(f"Loaded item_logQ.npy from {p}")
+                    break
+            except Exception as e:
+                print(f"warn: failed loading item_logQ.npy from {p}: {e}")
+
+        if logq_np is None:
+            # 即时计算：使用“出现次数”
+            counts = getattr(dataset, "item_appear_counts", None)
+            itemnum = getattr(dataset, "itemnum", 0)
+            if counts is None or itemnum <= 0:
+                # 退化
+                logq_np = np.full(itemnum + 1, -np.log(max(itemnum, 1.0)), dtype=np.float32)
+                logq_np[0] = -1e9
+            else:
+                counts = np.asarray(counts)
+                total = float(np.sum(counts[1:]))
+                if not np.isfinite(total) or total <= 0:
+                    q = np.zeros(itemnum + 1, dtype=np.float32)
+                    if itemnum > 0:
+                        q[1:] = 1.0 / float(itemnum)
+                else:
+                    q = counts.astype(np.float64)
+                    q[0] = 0.0
+                    q = (q / total).astype(np.float32)
+                q = np.maximum(q, 1e-12)
+                logq_np = np.log(q, dtype=np.float64).astype(np.float32)
+            # 尝试写回缓存（不强制）
+            try:
+                cache_root = os.environ.get("USER_CACHE_PATH", None)
+                if cache_root:
+                    Path(cache_root).mkdir(parents=True, exist_ok=True)
+                    np.save(Path(cache_root) / "item_logQ.npy", logq_np)
+                    print(f"Saved item_logQ.npy -> {Path(cache_root) / 'item_logQ.npy'}")
+            except Exception as e:
+                print(f"warn: failed saving item_logQ.npy: {e}")
+
+        return torch.from_numpy(logq_np).to(device=device, dtype=torch.float32)
+
     item_logQ_t = _load_item_logQ_for_train(dataset, device=device_t)
 
     # 模块初始化
@@ -504,11 +518,23 @@ if __name__ == '__main__':
 
             # 训练阶段
             for step, batch in pbar:
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts = batch
+                # 兼容包含两条负样本 SSL 视图
+                if isinstance(batch, (list, tuple)) and len(batch) >= 14:
+                    (seq, pos, neg, token_type, next_token_type, next_action_type,
+                     seq_feat, pos_feat, neg_feat, seq_ts, neg_feat_ssl1, neg_feat_ssl2,
+                     neg_ssl1, neg_ssl2) = batch
+                else:
+                    (seq, pos, neg, token_type, next_token_type, next_action_type,
+                     seq_feat, pos_feat, neg_feat, seq_ts) = batch
+                    neg_feat_ssl1, neg_feat_ssl2 = neg_feat, neg_feat
+                    neg_ssl1, neg_ssl2 = neg, neg
+
                 device_t = args.device
                 seq = seq.to(device_t, non_blocking=True)
                 pos = pos.to(device_t, non_blocking=True)
                 neg = neg.to(device_t, non_blocking=True)
+                neg_ssl1 = neg_ssl1.to(device_t, non_blocking=True)
+                neg_ssl2 = neg_ssl2.to(device_t, non_blocking=True)
                 token_type = token_type.to(device_t, non_blocking=True)
                 next_token_type = next_token_type.to(device_t, non_blocking=True)
                 next_action_type = next_action_type.to(device_t, non_blocking=True)
@@ -520,12 +546,25 @@ if __name__ == '__main__':
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                     )
-                    loss, stats = InfoNCE(
+                    loss_main, stats = InfoNCE(
                         pos_embs, neg_embs, log_feats, temperature=args.temperature,
                         next_token_type=next_token_type, next_action_type=next_action_type,
-                        pos_ids=pos, item_logQ=item_logQ_t, hard_neg_k=args.hard_neg_k,
+                        pos_ids=pos, item_logQ=item_logQ_t,
                         filter_current_only=True, neg_ids=neg
                     )
+
+                    # ====== SSL：对负样本特征两视图做对比 ======
+                    if args.ssl != 'none' and args.ssl_alpha > 0.0:
+                        z1 = model.feat2emb(neg_ssl1, neg_feat_ssl1, include_user=False)  # [B,L,D]
+                        z2 = model.feat2emb(neg_ssl2, neg_feat_ssl2, include_user=False)  # [B,L,D]
+                        mask_ssl = (token_type == 1)
+                        if mask_ssl.dtype is not torch.bool:
+                            mask_ssl = mask_ssl.bool()
+                        loss_ssl = ssl_loss(z1[mask_ssl], z2[mask_ssl], temperature=args.temperature)
+                    else:
+                        loss_ssl = torch.zeros((), device=log_feats.device)
+
+                    loss = loss_main + float(args.ssl_alpha) * loss_ssl
 
                 # 反向与优化
                 if scaler.is_enabled():
@@ -543,12 +582,15 @@ if __name__ == '__main__':
 
                 # 日志
                 log_json = json.dumps(
-                    {'global_step': global_step, 'loss': float(loss.item()), 'epoch': epoch,
-                     'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
+                    {'global_step': global_step, 'loss_main': float(loss_main.item()),
+                     'loss_ssl': float(loss_ssl.item()), 'loss_total': float(loss.item()),
+                     'epoch': epoch, 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
                 )
                 log_file.write(log_json + '\n')
                 log_file.flush()
-                writer.add_scalar('Loss/train', loss.item(), global_step)
+                writer.add_scalar('Loss/main', loss_main.item(), global_step)
+                writer.add_scalar('Loss/ssl', loss_ssl.item(), global_step)
+                writer.add_scalar('Loss/total', loss.item(), global_step)
                 writer.add_scalar('Diag/mean_pos_sim', stats['mean_pos_sim'], global_step)
                 writer.add_scalar('Diag/mean_neg_sim', stats['mean_neg_sim'], global_step)
                 writer.add_scalar('Diag/mean_hard_neg_sim', stats['mean_hard_neg_sim'], global_step)

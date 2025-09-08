@@ -46,10 +46,8 @@ def get_args():
     parser.add_argument('--temperature', default=0.03, type=float)
     parser.add_argument('--neg_pop_alpha', default=0.15, type=float)
     parser.add_argument('--weight_decay', default=0.0001, type=float)
-
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
-
     # Torch ANN（新增）
     parser.add_argument('--top_k', default=10, type=int)
     parser.add_argument('--torch_query_bs', default=4096, type=int, help='查询分块大小（默认: cuda=1024, cpu=256）')
@@ -62,6 +60,13 @@ def get_args():
     # 可选：直接在推理端声明组合（若未能读取到清单文件时作为兜底）
     parser.add_argument('--feature_crosses', nargs='*', default=["118+120", "116+118"],
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
+
+    # ==================== 自监督（由 dataset 进行增广，这里只做损失） ====================
+    parser.add_argument('--ssl', default='rfm_no_compl', choices=['none', 'rfm_no_compl'],
+                        help='自监督增广方式（dataset 内实现）；none 关闭')
+    parser.add_argument('--ssl_alpha', default=0.5, type=float, help='SSL 损失权重alpha')
+    parser.add_argument('--ssl_mask_ratio', default=0.5, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
+    parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
 
     args = parser.parse_args()
     return args
