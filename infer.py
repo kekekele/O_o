@@ -62,10 +62,12 @@ def get_args():
                         help='例如: ["118+120"]；缺省(None)表示不使用交叉特征')
 
     # ==================== 自监督（由 dataset 进行增广，这里只做损失） ====================
-    parser.add_argument('--ssl', default='rfm_no_compl', choices=['none', 'rfm_no_compl'],
-                        help='自监督增广方式（dataset 内实现）；none 关闭')
+    parser.add_argument('--ssl', default='cfm',
+                        choices=['none', 'rfm_no_compl', 'cfm'],
+                        help='自监督增广方式（dataset 内实现）；none 关闭；rfm_no_compl 随机掩蔽；cfm 相关性感知互补掩蔽'
+                        )
     parser.add_argument('--ssl_alpha', default=0.5, type=float, help='SSL 损失权重alpha')
-    parser.add_argument('--ssl_mask_ratio', default=0.5, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
+    parser.add_argument('--ssl_mask_ratio', default=0.6, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
     parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
 
     args = parser.parse_args()

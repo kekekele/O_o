@@ -58,7 +58,7 @@ def get_args():
     # ==================== 自监督（由 dataset 进行增广，这里只做损失） ====================
     parser.add_argument('--ssl', default='rfm_no_compl', choices=['none', 'rfm_no_compl'], help='自监督增广方式（dataset 内实现）；none 关闭')
     parser.add_argument('--ssl_alpha', default=0.5, type=float, help='SSL 损失权重alpha')
-    parser.add_argument('--ssl_mask_ratio', default=0.5, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
+    parser.add_argument('--ssl_mask_ratio', default=0.6, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
     parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
 
     args = parser.parse_args()
@@ -223,15 +223,15 @@ def ssl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Te
 
 
 @torch.no_grad()
-def evaluate_acc1(model, valid_loader, device, amp_enabled: bool, amp_dtype):
+def evaluate_hr_ndcg10_and_score(model, valid_loader, device, amp_enabled: bool, amp_dtype):
     """
-    更快速的评估：acc@1（top-1 命中率）
-    候选集与训练 InfoNCE 一致：每个查询的候选集=其正样本 + 批内 item 位置的负样本池。
+    更改为评估 HR@10、NDCG@10 以及综合分数：
+        score = 0.31 * HR@10 + 0.69 * NDCG@10
+    候选集与原 evaluate_acc1 保持一致：每个查询的候选集=其正样本 + 批内 item 位置的负样本池。
     仅在点击位置(next_action_type==1)计算。
     """
     model.eval()
-    total = 0
-    correct = 0
+    all_ranks = []
 
     for batch in valid_loader:
         # 兼容包含 SSL 视图的 batch（训练集 collate_fn 返回 12 个元素）
@@ -263,21 +263,30 @@ def evaluate_acc1(model, valid_loader, device, amp_enabled: bool, amp_dtype):
             P = pos_embs[mask]                        # [M,D]
             N = neg_embs[next_token_type == 1]        # [N,D] 批内负样本池
 
-            # logits: 将正样本放在 index=0，其他为负样本
             pos_logits = (Q * P).sum(dim=-1, keepdim=True)  # [M,1]
             if N.numel() == 0:
-                logits = pos_logits
+                ranks = torch.ones_like(pos_logits, dtype=torch.long).squeeze(1)
             else:
                 neg_logits = Q @ N.t()                        # [M,N]
-                logits = torch.cat([pos_logits, neg_logits], dim=1)  # [M, 1+N]
+                # rank = 1 + 负样本中严格大于正样本得分的个数（降序排名）
+                # 如需平分处理，可将 (>=) 分摊，这里保持严格大于以避免乐观偏置。
+                greater_cnt = (neg_logits > pos_logits).sum(dim=1)
+                ranks = 1 + greater_cnt  # [M]
 
-        pred = torch.argmax(logits, dim=1)  # 预测索引
-        correct += (pred == 0).sum().item()
-        total += logits.size(0)
+            all_ranks.append(ranks)
 
-    if total == 0:
-        return 0.0
-    return correct / total
+    if len(all_ranks) == 0:
+        return {'hr10': 0.0, 'ndcg10': 0.0, 'score': 0.0}
+
+    ranks = torch.cat(all_ranks, dim=0).to(torch.float32)  # [T]
+    hits10 = (ranks <= 10).to(torch.float32)
+    hr10 = hits10.mean().item()
+
+    # 单一正样本的 NDCG@10：在命中前10名时为 1/log2(rank+1)，否则为 0
+    ndcg10 = (hits10 * (1.0 / torch.log2(ranks + 1.0))).mean().item()
+
+    score = 0.31 * hr10 + 0.69 * ndcg10
+    return {'hr10': hr10, 'ndcg10': ndcg10, 'score': score}
 
 
 if __name__ == '__main__':
@@ -498,7 +507,10 @@ if __name__ == '__main__':
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    best_val = float('inf')
+    # 早停相关（基于 score 最大化）
+    best_score = float('-inf')
+    epochs_no_improve = 0
+
     global_step = 0
 
     if args.inference_only:
@@ -599,17 +611,39 @@ if __name__ == '__main__':
 
                 global_step += 1
 
-            val_metrics = evaluate_acc1(
+            # ===== 验证：HR@10、NDCG@10、score =====
+            val_dict = evaluate_hr_ndcg10_and_score(
                 model, val_loader, device=torch.device(args.device),
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype
             )
-            writer.add_scalar('Val/acc@1', val_metrics, epoch)
+            writer.add_scalar('Val/HR@10', val_dict['hr10'], epoch)
+            writer.add_scalar('Val/NDCG@10', val_dict['ndcg10'], epoch)
+            writer.add_scalar('Val/score', val_dict['score'], epoch)
 
             # 保存 checkpoint（每个 epoch）
             save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'),
                             f"global_step{global_step}.epoch={epoch}")
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), save_dir / "model.pt")
+
+            # 早停逻辑（最大化 score）
+            current_score = val_dict['score']
+            if current_score > best_score + 1e-12:
+                best_score = current_score
+                epochs_no_improve = 0
+                # 可选：额外保存最佳模型
+                best_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), "best")
+                best_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), best_dir / "model.pt")
+                with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
+                    json.dump(val_dict, f, ensure_ascii=False, indent=2)
+                print(f"[Epoch {epoch}] New best score: {best_score:.6f} (HR@10={val_dict['hr10']:.6f}, NDCG@10={val_dict['ndcg10']:.6f})")
+            else:
+                epochs_no_improve += 1
+                print(f"[Epoch {epoch}] No improvement. best={best_score:.6f}, curr={current_score:.6f}. patience={epochs_no_improve}/2")
+                if epochs_no_improve >= 2:
+                    print(f"Early stopping triggered after {epoch} epochs. Best score={best_score:.6f}")
+                    break
 
     print("Done")
     writer.close()
