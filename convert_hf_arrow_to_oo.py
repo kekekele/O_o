@@ -2,64 +2,96 @@ import argparse
 import json
 import pickle
 import time
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 from tqdm import tqdm
 
 
-# [2026-04-24] 新增：将 HuggingFace 数据转换为本项目可直接读取的数据目录结构。
-# 目标产物：
-# - indexer.pkl
-# - item_feat_dict.json
-# - seq.jsonl + seq_offsets.pkl
-# - 可选：predict_seq.jsonl + predict_seq_offsets.pkl
-# - 可选：predict_set.jsonl（供 infer.py 读取）
-# - 可选：creative_emb/emb_81_32.pkl（占位多模态特征）
+"""
+输入目录结构（HuggingFace 数据下载后本地目录，按子目录组织）：
+1. seq/: 用户行为序列表。每条记录形如
+     {
+         "user_id": <int>,
+         "seq": [
+             {"item_id": <int>, "action_type": <int>, "timestamp": <int>},
+             ...
+         ]
+     }
+2. user_feat/: 用户侧特征表，至少包含 user_id 与若干特征字段。
+3. item_feat/: 物品侧特征表，至少包含 item_id 与若干特征字段。
+4. candidate/: （可选）候选集，至少包含 item_id 与 retrieval_id。
+
+输出目录结构（本项目 dataset.py / infer.py 可直接读取）：
+1. indexer.pkl: {"u": 原始user_id->reid, "i": 原始item_id->reid, "f": 特征值映射}
+2. item_feat_dict.json: {"item_reid": {"feature_id": feature_value, ...}, ...}
+3. seq.jsonl + seq_offsets.pkl: 训练序列（每行一个用户）与行偏移。
+4. predict_seq.jsonl + predict_seq_offsets.pkl: （可选）推理序列。
+5. predict_set.jsonl: （可选）候选库，字段为 creative_id/retrieval_id/features。
+6. creative_emb/: （可选，需开启 --with-mm-emb）多模态向量目录
+    - emb_81_32.pkl
+    - emb_82_1024/part-xxxxx.json ... emb_86_3584/part-xxxxx.json
+"""
+
+
+# [2026-04-25] Clean rewrite: TencentGR-1M schema aligned + large-data friendly.
 
 # ================================================================
-# [2026-04-24] 配置区块（后续若要适配新数据，只改这里）
+# Config block (change here only if source schema changes)
 # ================================================================
-
-# 目录名约定
 SEQ_DIR = "seq"
 PREDICT_SEQ_DIR = "predict_seq"
 USER_FEAT_DIR = "user_feat"
 ITEM_FEAT_DIR = "item_feat"
-CANDIDATE_DIR = "predict_set"
+CANDIDATE_DIR = "candidate"
+MM_EMB_DIR = "mm_emb"
 
-# 序列字段约定
 USER_ID_COL = "user_id"
 ITEM_ID_COL = "item_id"
 TIMESTAMP_COL = "timestamp"
 ACTION_COL = "action_type"
-USER_FEAT_COL = "user_feat"
-ITEM_FEAT_COL = "item_feat"
 
-# 候选集字段约定
-CANDIDATE_CREATIVE_ID_COL = "creative_id"
+# Candidate table columns
+CANDIDATE_ITEM_ID_COL = "item_id"
 CANDIDATE_RETRIEVAL_ID_COL = "retrieval_id"
-CANDIDATE_FEATURES_COL = "features"
 
-# 行为开关
+# Feature ids used by baseline
+ITEM_SPARSE_FEAT_IDS = [
+    "100", "117", "111", "118", "101", "102", "119", "120", "114", "112", "121", "115", "122", "116"
+]
+USER_SPARSE_FEAT_IDS = ["103", "104", "105", "109"]
+USER_ARRAY_FEAT_IDS = ["106", "107", "108", "110"]
+
 SORT_BY_TIMESTAMP = True
 GENERATE_DUMMY_EMB81 = False
+VERBOSE = False
 
+MM_EMB_DIMS = {
+    "81": 32,
+    "82": 1024,
+    "83": 3584,
+    "84": 4096,
+    "85": 3584,
+    "86": 3584,
+}
 # ================================================================
 
 
-def _log(msg: str) -> None:
+def _log(msg: str, force: bool = False) -> None:
+    if not (VERBOSE or force):
+        return
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Convert HuggingFace data to O_o project format")
+    p = argparse.ArgumentParser(description="Convert TencentGR HF folders to O_o project format")
     p.add_argument("--input", required=True, type=str, help="Input root path")
     p.add_argument("--output", required=True, type=str, help="Output directory")
-    p.add_argument("--strict", action="store_true", help="Strict mode: missing optional dirs or zero rows will raise error")
+    p.add_argument("--strict", action="store_true", help="Fail when optional folders are missing")
+    p.add_argument("--verbose", action="store_true", help="Enable detailed progress logs")
+    p.add_argument("--with-mm-emb", action="store_true", help="Convert mm_emb directory to creative_emb outputs")
     return p.parse_args()
 
 
@@ -76,7 +108,7 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(v)
     if isinstance(v, str):
         s = v.strip()
-        if s == "":
+        if not s:
             return default
         try:
             return int(float(s))
@@ -102,9 +134,8 @@ def _iter_jsonl_file(path: Path) -> Iterable[Any]:
     with open(path, "rb") as f:
         for line in f:
             s = line.strip()
-            if not s:
-                continue
-            yield json.loads(s.decode("utf-8", errors="ignore"))
+            if s:
+                yield json.loads(s.decode("utf-8", errors="ignore"))
 
 
 def _iter_json_file(path: Path) -> Iterable[Any]:
@@ -121,55 +152,256 @@ def _iter_arrow_file(path: Path) -> Iterable[Any]:
     from datasets import Dataset
 
     ds = Dataset.from_file(str(path))
-    for r in ds:
-        yield r
+    for row in ds:
+        yield row
+
+
+def _iter_parquet_file(path: Path) -> Iterable[Any]:
+    try:
+        import pyarrow.parquet as pq
+    except Exception as e:
+        raise RuntimeError(f"Reading parquet requires pyarrow: {e}")
+
+    pf = pq.ParquetFile(str(path))
+    for batch in pf.iter_batches(batch_size=10000):
+        for row in batch.to_pylist():
+            yield row
 
 
 def _iter_records_from_dir(dir_path: Path) -> Iterable[Any]:
+    """按目录递归读取记录，支持 jsonl/json/arrow/parquet。"""
     if not dir_path.exists():
         return
     files = sorted([p for p in dir_path.rglob("*") if p.is_file()])
-    _log(f"scan dir={dir_path.as_posix()} files={len(files)}")
+    _log(f"扫描目录: {dir_path.as_posix()}，文件数={len(files)}")
     for p in files:
-        suffix = p.suffix.lower()
-        _log(f"reading file: {p.as_posix()}")
-        if suffix == ".jsonl":
+        suf = p.suffix.lower()
+        _log(f"读取文件: {p.as_posix()}")
+        if suf == ".jsonl":
             for r in _iter_jsonl_file(p):
                 yield r
-        elif suffix == ".json":
+        elif suf == ".json":
             for r in _iter_json_file(p):
                 yield r
-        elif suffix == ".arrow":
+        elif suf == ".arrow":
             for r in _iter_arrow_file(p):
+                yield r
+        elif suf == ".parquet":
+            for r in _iter_parquet_file(p):
                 yield r
 
 
-def _extract_id_and_feat(row: Any, id_candidates: List[str], feat_candidates: List[str]) -> Tuple[Optional[str], Dict[str, Any]]:
-    if isinstance(row, dict):
-        rid = None
-        for k in id_candidates:
-            if k in row and row[k] is not None:
-                rid = str(row[k])
+def _iter_records_from_file(path: Path) -> Iterable[Any]:
+    """按单文件读取记录，支持 jsonl/json/arrow/parquet。"""
+    suf = path.suffix.lower()
+    if suf == ".jsonl":
+        for r in _iter_jsonl_file(path):
+            yield r
+    elif suf == ".json":
+        for r in _iter_json_file(path):
+            yield r
+    elif suf == ".arrow":
+        for r in _iter_arrow_file(path):
+            yield r
+    elif suf == ".parquet":
+        for r in _iter_parquet_file(path):
+            yield r
+
+
+def _iter_mm_source_files(mm_dir: Path) -> List[Path]:
+    files = []
+    for p in mm_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in [".arrow", ".parquet", ".jsonl", ".json"]:
+            files.append(p)
+    return sorted(files)
+
+
+def _coerce_emb_vec(v: Any, dim: int) -> List[float]:
+    if isinstance(v, dict):
+        if "emb" in v:
+            v = v["emb"]
+        elif "vector" in v:
+            v = v["vector"]
+        elif "value" in v:
+            v = v["value"]
+
+    if isinstance(v, np.ndarray):
+        arr = v.astype(np.float32).reshape(-1)
+    elif isinstance(v, list):
+        arr = np.asarray(v, dtype=np.float32).reshape(-1)
+    else:
+        return []
+
+    if arr.size == dim:
+        return arr.tolist()
+    if arr.size > dim:
+        return arr[:dim].tolist()
+    if arr.size == 0:
+        return []
+    out = np.zeros((dim,), dtype=np.float32)
+    out[:arr.size] = arr
+    return out.tolist()
+
+
+def _extract_mm_emb_from_row(row: Any) -> Tuple[str, Dict[str, List[float]]]:
+    if not isinstance(row, dict):
+        return "", {}
+
+    raw_id = ""
+    for k in ["anonymous_cid", "creative_id", "item_id", "cid", "i"]:
+        if k in row and row[k] is not None:
+            raw_id = str(row[k])
+            break
+
+    if not raw_id:
+        return "", {}
+
+    out: Dict[str, List[float]] = {}
+
+    feat_id = row.get("feat_id", None)
+    if feat_id is not None and "emb" in row:
+        fid = str(feat_id)
+        if fid in MM_EMB_DIMS:
+            vec = _coerce_emb_vec(row.get("emb"), MM_EMB_DIMS[fid])
+            if vec:
+                out[fid] = vec
+
+    for container_key in ["mm_emb", "features", "embeddings"]:
+        c = row.get(container_key)
+        if not isinstance(c, dict):
+            continue
+        for k, v in c.items():
+            fid = str(k)
+            if fid.startswith("emb_"):
+                fid = fid.replace("emb_", "", 1)
+            if fid in MM_EMB_DIMS:
+                vec = _coerce_emb_vec(v, MM_EMB_DIMS[fid])
+                if vec:
+                    out[fid] = vec
+
+    for fid, dim in MM_EMB_DIMS.items():
+        for key in [f"emb_{fid}", fid, f"mm_emb_{fid}"]:
+            if key in row:
+                vec = _coerce_emb_vec(row.get(key), dim)
+                if vec:
+                    out[fid] = vec
                 break
-        feat = {}
-        for k in feat_candidates:
-            if k in row and isinstance(row[k], dict):
-                feat = _norm_feat_dict(row[k])
-                break
-        if not feat:
-            # 若没有嵌套字段，则尝试把其余字段视作 feature_id -> value
-            tmp = {}
-            for k, v in row.items():
-                if k in id_candidates:
+
+    return raw_id, out
+
+
+def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool) -> None:
+    """
+    将 mm_emb 目录转换为项目可读取的 creative_emb 结构。
+    - 81: 写为 emb_81_32.pkl
+    - 82~86: 写为 emb_<fid>_<dim>/part-xxxxx.json（每行一条）
+    """
+    if not mm_dir.exists():
+        if strict:
+            raise ValueError(f"missing mm_emb directory: {mm_dir.as_posix()}")
+        _log(f"未找到 mm_emb 目录，跳过: {mm_dir.as_posix()}", force=True)
+        return
+
+    files = _iter_mm_source_files(mm_dir)
+    if len(files) == 0:
+        if strict:
+            raise ValueError(f"mm_emb has no supported files under: {mm_dir.as_posix()}")
+        _log(f"mm_emb 目录下无可解析文件，跳过: {mm_dir.as_posix()}", force=True)
+        return
+
+    creative_root = out_dir / "creative_emb"
+    creative_root.mkdir(parents=True, exist_ok=True)
+    for fid, dim in MM_EMB_DIMS.items():
+        if fid == "81":
+            continue
+        (creative_root / f"emb_{fid}_{dim}").mkdir(parents=True, exist_ok=True)
+
+    _log(f"开始转换 mm_emb: files={len(files)}", force=True)
+
+    emb81: Dict[str, np.ndarray] = {}
+    per_fid_written = {fid: 0 for fid in MM_EMB_DIMS.keys()}
+    total_rows = 0
+
+    for idx, src in enumerate(files, start=1):
+        _log(f"mm_emb 文件 {idx}/{len(files)}: {src.as_posix()}", force=True)
+        writers: Dict[str, Any] = {}
+        try:
+            for row in tqdm(_iter_records_from_file(src), desc=f"mm_emb {idx}/{len(files)}", dynamic_ncols=True, disable=not VERBOSE):
+                total_rows += 1
+                raw_id, mm_map = _extract_mm_emb_from_row(row)
+                if not raw_id or not mm_map:
                     continue
-                if isinstance(v, (dict, list, int, float, str, np.integer, np.floating)):
-                    tmp[str(k)] = v
-            feat = _norm_feat_dict(tmp)
-        return rid, feat
-    return None, {}
+
+                for fid, vec in mm_map.items():
+                    if fid == "81":
+                        emb81[raw_id] = np.asarray(vec, dtype=np.float32)
+                        per_fid_written[fid] += 1
+                    else:
+                        if fid not in writers:
+                            part = creative_root / f"emb_{fid}_{MM_EMB_DIMS[fid]}" / f"part-{idx:05d}.json"
+                            writers[fid] = open(part, "w", encoding="utf-8")
+                        line = {"anonymous_cid": raw_id, "emb": vec}
+                        writers[fid].write(json.dumps(line, ensure_ascii=False) + "\n")
+                        per_fid_written[fid] += 1
+
+                if total_rows % 200000 == 0:
+                    _log(
+                        "mm_emb 转换进度: "
+                        f"rows={total_rows}, emb81_items={len(emb81)}, "
+                        f"written={{81:{per_fid_written['81']},82:{per_fid_written['82']},83:{per_fid_written['83']},84:{per_fid_written['84']},85:{per_fid_written['85']},86:{per_fid_written['86']}}}",
+                        force=True,
+                    )
+        finally:
+            for _, wf in writers.items():
+                wf.close()
+
+    emb81_path = creative_root / "emb_81_32.pkl"
+    if len(emb81) > 0:
+        with open(emb81_path, "wb") as f:
+            pickle.dump(emb81, f)
+        _log(f"写出 mm_emb 81 文件: {emb81_path.as_posix()} (items={len(emb81)})", force=True)
+    else:
+        _log("未解析到 emb_81 数据，未写 emb_81_32.pkl", force=True)
+
+    _log(
+        "mm_emb 转换完成: "
+        f"rows={total_rows}, written={{81:{per_fid_written['81']},82:{per_fid_written['82']},83:{per_fid_written['83']},84:{per_fid_written['84']},85:{per_fid_written['85']},86:{per_fid_written['86']}}}",
+        force=True,
+    )
+
+
+def _extract_id_and_feat(row: Any, id_candidates: List[str], feat_candidates: List[str]) -> Tuple[str, Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return "", {}
+
+    rid = ""
+    for k in id_candidates:
+        if k in row and row[k] is not None:
+            rid = str(row[k])
+            break
+
+    feat: Dict[str, Any] = {}
+    for k in feat_candidates:
+        if k in row and isinstance(row[k], dict):
+            feat = _norm_feat_dict(row[k])
+            break
+
+    if not feat:
+        tmp: Dict[str, Any] = {}
+        for k, v in row.items():
+            if k in id_candidates:
+                continue
+            if isinstance(v, (dict, list, int, float, str, np.integer, np.floating)):
+                tmp[str(k)] = v
+        feat = _norm_feat_dict(tmp)
+
+    return rid, feat
 
 
 def _load_feature_map_from_dir(dir_path: Path, is_user: bool) -> Dict[str, Dict[str, Any]]:
+    """加载 user_feat / item_feat 为内存字典，供后续快速查特征。"""
     out: Dict[str, Dict[str, Any]] = {}
     if not dir_path.exists():
         return out
@@ -177,17 +409,18 @@ def _load_feature_map_from_dir(dir_path: Path, is_user: bool) -> Dict[str, Dict[
     if is_user:
         id_candidates = ["user_id", "uid", "u", "wuid", "anonymous_uid"]
         feat_candidates = ["user_feat", "features", "feat", "feature"]
+        role = "user"
     else:
         id_candidates = ["item_id", "creative_id", "cid", "anonymous_cid", "i"]
         feat_candidates = ["item_feat", "features", "feat", "feature"]
+        role = "item"
 
-    role = "user" if is_user else "item"
-    _log(f"start load {role}_feat map from {dir_path.as_posix()}")
+    _log(f"开始加载{role}特征映射: {dir_path.as_posix()}")
     n_rows = 0
     for row in _iter_records_from_dir(dir_path):
         n_rows += 1
-        rid, feat = _extract_id_and_feat(row, id_candidates=id_candidates, feat_candidates=feat_candidates)
-        if rid is None:
+        rid, feat = _extract_id_and_feat(row, id_candidates, feat_candidates)
+        if not rid:
             continue
         if rid not in out:
             out[rid] = feat
@@ -197,166 +430,56 @@ def _load_feature_map_from_dir(dir_path: Path, is_user: bool) -> Dict[str, Dict[
                 if k not in base:
                     base[k] = v
         if n_rows % 200000 == 0:
-            _log(f"{role}_feat parsed rows={n_rows}, unique_ids={len(out)}")
-    _log(f"done load {role}_feat map: rows={n_rows}, unique_ids={len(out)}")
+            _log(f"{role}特征解析进度: rows={n_rows}, unique_ids={len(out)}")
+
+    _log(f"{role}特征映射加载完成: rows={n_rows}, unique_ids={len(out)}")
     return out
 
 
-def _row_to_event(
-    row: Any,
-    user_col: str,
-    item_col: str,
-    ts_col: str,
-    action_col: str,
-    user_feat_col: str,
-    item_feat_col: str,
-    user_feat_map: Dict[str, Dict[str, Any]],
-    item_feat_map: Dict[str, Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    # 博文示例：record = [user_id, item_id, user_feature, item_feature, action_type, timestamp]
-    if isinstance(row, (list, tuple)) and len(row) >= 6:
-        u_raw = row[0]
-        i_raw = row[1]
-        uf = _norm_feat_dict(row[2]) if isinstance(row[2], dict) else {}
-        itf = _norm_feat_dict(row[3]) if isinstance(row[3], dict) else {}
-        act = _safe_int(row[4], 0)
-        ts = _safe_int(row[5], 0)
-
-        u_key = str(u_raw) if u_raw is not None else None
-        i_key = str(i_raw) if i_raw is not None else None
-
-        if not uf and u_key in user_feat_map and i_raw in (None, 0):
-            uf = user_feat_map[u_key]
-        if not itf and i_key in item_feat_map:
-            itf = item_feat_map[i_key]
-
-        return {
-            "u_raw": u_key,
-            "i_raw": i_key,
-            "user_feat": uf,
-            "item_feat": itf,
-            "action": act,
-            "ts": ts,
-        }
-
-    if isinstance(row, dict):
-        u_raw = row.get(user_col, None)
-        i_raw = row.get(item_col, None)
-        ts = _safe_int(row.get(ts_col, 0), 0)
-        act = _safe_int(row.get(action_col, 0), 0)
-
-        uf = _norm_feat_dict(row.get(user_feat_col, {}))
-        itf = _norm_feat_dict(row.get(item_feat_col, {}))
-
-        u_key = str(u_raw) if u_raw is not None else None
-        i_key = str(i_raw) if i_raw is not None else None
-
-        # 目录模式下常见：序列里不带完整特征，使用 side-table 回填。
-        if not uf and u_key in user_feat_map and i_raw in (None, 0):
-            uf = user_feat_map[u_key]
-        if not itf and i_key in item_feat_map:
-            itf = item_feat_map[i_key]
-
-        return {
-            "u_raw": u_key,
-            "i_raw": i_key,
-            "user_feat": uf,
-            "item_feat": itf,
-            "action": act,
-            "ts": ts,
-        }
-
-    return None
-
-
-def _load_events_from_seq_dir(
-    seq_dir: Path,
-    user_col: str,
-    item_col: str,
-    ts_col: str,
-    action_col: str,
-    user_feat_col: str,
-    item_feat_col: str,
-    user_feat_map: Dict[str, Dict[str, Any]],
-    item_feat_map: Dict[str, Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    _log(f"start load events from {seq_dir.as_posix()}")
-    events: List[Dict[str, Any]] = []
-    n_rows = 0
-    for row in _iter_records_from_dir(seq_dir):
-        n_rows += 1
-        ev = _row_to_event(
-            row,
-            user_col=user_col,
-            item_col=item_col,
-            ts_col=ts_col,
-            action_col=action_col,
-            user_feat_col=user_feat_col,
-            item_feat_col=item_feat_col,
-            user_feat_map=user_feat_map,
-            item_feat_map=item_feat_map,
-        )
-        if ev is not None:
-            events.append(ev)
-        if n_rows % 200000 == 0:
-            _log(f"events parsed rows={n_rows}, valid_events={len(events)}")
-    _log(f"done load events: rows={n_rows}, valid_events={len(events)}")
-    return events
-
-
-def _events_to_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for e in tqdm(events, total=len(events), desc="events->rows", dynamic_ncols=True):
-        out.append(
-            {
-                "user_id": e.get("u_raw", None),
-                "item_id": e.get("i_raw", None),
-                "timestamp": e.get("ts", 0),
-                "action_type": e.get("action", 0),
-                "user_feat": e.get("user_feat", {}) or {},
-                "item_feat": e.get("item_feat", {}) or {},
-            }
-        )
-    return out
-
-
-def _build_id_maps(train_rows: List[Dict[str, Any]], predict_rows: List[Dict[str, Any]],
-                   user_col: str, item_col: str) -> Tuple[Dict[str, int], Dict[str, int]]:
+def _scan_seq_ids_from_dir(seq_dir: Path) -> Tuple[set, set, int]:
+    """第一遍扫描 seq，仅提取 user_id/item_id 集合，避免占用大内存。"""
     users = set()
     items = set()
+    rows = 0
+    _log("第一遍扫描 seq：提取 user/item ID")
 
-    for rows, tag in ((train_rows, "train"), (predict_rows, "predict")):
-        for r in tqdm(rows, total=len(rows), desc=f"build_id_maps({tag})", dynamic_ncols=True):
-            u = r.get(user_col, None)
-            i = r.get(item_col, None)
+    for row in _iter_records_from_dir(seq_dir):
+        rows += 1
+        if isinstance(row, dict) and isinstance(row.get("seq"), list):
+            u = row.get(USER_ID_COL)
+            if u is not None:
+                users.add(str(u))
+            for ev in row.get("seq", []):
+                if isinstance(ev, dict):
+                    i = ev.get(ITEM_ID_COL)
+                    if i is not None:
+                        items.add(str(i))
+        elif isinstance(row, dict):
+            u = row.get(USER_ID_COL)
+            i = row.get(ITEM_ID_COL)
             if u is not None:
                 users.add(str(u))
             if i is not None:
                 items.add(str(i))
 
-    u_map = {u: idx + 1 for idx, u in enumerate(sorted(users))}
-    i_map = {i: idx + 1 for idx, i in enumerate(sorted(items))}
-    return u_map, i_map
+        if rows % 200000 == 0:
+            _log(f"第一遍进度: rows={rows}, users={len(users)}, items={len(items)}")
+
+    _log(f"第一遍完成: rows={rows}, users={len(users)}, items={len(items)}")
+    return users, items, rows
 
 
-def _collect_feature_vocab(rows: List[Dict[str, Any]], user_feat_col: str, item_feat_col: str) -> Dict[str, Dict[str, int]]:
-    # 固定与项目对齐的特征组
-    user_sparse = ["103", "104", "105", "109"]
-    user_array = ["106", "107", "108", "110"]
-    item_sparse = ["100", "117", "111", "118", "101", "102", "119", "120", "114", "112", "121", "115", "122", "116"]
+def _build_feature_vocab_from_maps(user_feat_map: Dict[str, Dict[str, Any]], item_feat_map: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """从 user/item 特征映射中构建 indexer['f'] 的离散值重映射。"""
+    values: Dict[str, set] = {k: set() for k in USER_SPARSE_FEAT_IDS + USER_ARRAY_FEAT_IDS + ITEM_SPARSE_FEAT_IDS}
 
-    values: Dict[str, set] = {k: set() for k in user_sparse + user_array + item_sparse}
-
-    for r in tqdm(rows, total=len(rows), desc="collect_feature_vocab", dynamic_ncols=True):
-        uf = _norm_feat_dict(r.get(user_feat_col, {}))
-        itf = _norm_feat_dict(r.get(item_feat_col, {}))
-
-        for fid in user_sparse:
+    _log("构建特征词表（indexer['f']）")
+    for _, uf in tqdm(user_feat_map.items(), total=len(user_feat_map), desc="f_vocab(user)", dynamic_ncols=True):
+        for fid in USER_SPARSE_FEAT_IDS:
             v = _safe_int(uf.get(fid, 0), 0)
             if v > 0:
                 values[fid].add(v)
-
-        for fid in user_array:
+        for fid in USER_ARRAY_FEAT_IDS:
             arr = uf.get(fid, [])
             if not isinstance(arr, list):
                 arr = [arr]
@@ -365,119 +488,159 @@ def _collect_feature_vocab(rows: List[Dict[str, Any]], user_feat_col: str, item_
                 if iv > 0:
                     values[fid].add(iv)
 
-        for fid in item_sparse:
+    for _, itf in tqdm(item_feat_map.items(), total=len(item_feat_map), desc="f_vocab(item)", dynamic_ncols=True):
+        for fid in ITEM_SPARSE_FEAT_IDS:
             v = _safe_int(itf.get(fid, 0), 0)
             if v > 0:
                 values[fid].add(v)
 
     out: Dict[str, Dict[str, int]] = {}
     for fid, s in values.items():
-        sorted_vals = sorted(s)
-        out[fid] = {str(v): idx + 1 for idx, v in enumerate(sorted_vals)}
+        out[fid] = {str(v): idx + 1 for idx, v in enumerate(sorted(s))}
     return out
 
 
-def _build_item_feat_dict(rows: List[Dict[str, Any]], item_col: str, item_feat_col: str,
-                          i_map: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
-    item_feat_by_reid: Dict[int, Dict[str, Any]] = {}
-    for r in tqdm(rows, total=len(rows), desc="build_item_feat_dict", dynamic_ncols=True):
-        raw_i = r.get(item_col, None)
-        if raw_i is None:
-            continue
-        raw_i_str = str(raw_i)
-        if raw_i_str not in i_map:
-            continue
-        i_reid = i_map[raw_i_str]
-
-        feat = _norm_feat_dict(r.get(item_feat_col, {}))
-        if i_reid not in item_feat_by_reid:
-            item_feat_by_reid[i_reid] = feat
-        else:
-            # 后出现的样本补齐缺失键
-            base = item_feat_by_reid[i_reid]
-            for k, v in feat.items():
-                if k not in base:
-                    base[k] = v
-
-    return {str(k): v for k, v in item_feat_by_reid.items()}
+def _write_item_feat_dict_from_map(path: Path, i_map: Dict[str, int], item_feat_map: Dict[str, Dict[str, Any]]) -> int:
+    """按 item reid 写 item_feat_dict.json（流式写，减少中间对象）。"""
+    cnt = 0
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{")
+        first = True
+        for raw_i, rid in tqdm(i_map.items(), total=len(i_map), desc="write item_feat_dict", dynamic_ncols=True):
+            feat = item_feat_map.get(str(raw_i), {})
+            if not isinstance(feat, dict):
+                feat = {}
+            if not first:
+                f.write(",")
+            first = False
+            f.write(json.dumps(str(rid), ensure_ascii=False))
+            f.write(":")
+            f.write(json.dumps(feat, ensure_ascii=False))
+            cnt += 1
+        f.write("}")
+    return cnt
 
 
-def _build_user_sequences(rows: List[Dict[str, Any]],
-                          u_map: Dict[str, int], i_map: Dict[str, int],
-                          user_col: str, item_col: str, ts_col: str, action_col: str,
-                          user_feat_col: str, item_feat_col: str,
-                          sort_by_timestamp: bool) -> Dict[int, List[List[Any]]]:
-    seqs: Dict[int, List[List[Any]]] = defaultdict(list)
-
-    for r in tqdm(rows, total=len(rows), desc="build_user_sequences", dynamic_ncols=True):
-        raw_u = r.get(user_col, None)
-        raw_i = r.get(item_col, None)
-        if raw_u is None or raw_i is None:
-            continue
-
-        u_reid = u_map.get(str(raw_u), 0)
-        i_reid = i_map.get(str(raw_i), 0)
-        if u_reid <= 0 or i_reid <= 0:
-            continue
-
-        ts = _safe_int(r.get(ts_col, 0), 0)
-        act = _safe_int(r.get(action_col, 0), 0)
-        uf = _norm_feat_dict(r.get(user_feat_col, {}))
-        itf = _norm_feat_dict(r.get(item_feat_col, {}))
-
-        rec = [u_reid, i_reid, uf, itf, act, ts]
-        seqs[u_reid].append(rec)
-
-    if sort_by_timestamp:
-        for u in list(seqs.keys()):
-            seqs[u].sort(key=lambda x: _safe_int(x[5], 0))
-
-    return seqs
-
-
-def _write_seq_and_offsets(path_jsonl: Path, path_offsets: Path, seqs_by_uid: Dict[int, List[List[Any]]]) -> None:
-    # 以 uid 升序写，每个 uid 一行。
+def _write_seq_from_hf_seq_dir(
+    seq_dir: Path,
+    out_jsonl: Path,
+    out_offsets: Path,
+    u_map: Dict[str, int],
+    i_map: Dict[str, int],
+    user_feat_map: Dict[str, Dict[str, Any]],
+    item_feat_map: Dict[str, Dict[str, Any]],
+    sort_by_timestamp: bool,
+) -> int:
+    """
+    第二遍扫描 seq 并直接写目标 seq.jsonl 与 seq_offsets.pkl。
+    输出单条 record 结构：
+        [user_reid, item_reid, user_feat(dict), item_feat(dict), action_type, timestamp]
+    """
     offsets: List[int] = []
-    with open(path_jsonl, "wb") as f:
-        uids = sorted(seqs_by_uid.keys())
-        for uid in tqdm(uids, total=len(uids), desc=f"write {path_jsonl.name}", dynamic_ncols=True):
-            offsets.append(f.tell())
-            line = json.dumps(seqs_by_uid[uid], ensure_ascii=False).encode("utf-8") + b"\n"
-            f.write(line)
+    written = 0
 
-    with open(path_offsets, "wb") as f:
-        pickle.dump(offsets, f)
+    with open(out_jsonl, "wb") as f:
+        for row in _iter_records_from_dir(seq_dir):
+            if not (isinstance(row, dict) and isinstance(row.get("seq"), list)):
+                continue
+
+            raw_u = row.get(USER_ID_COL)
+            if raw_u is None:
+                continue
+            u_key = str(raw_u)
+            u_reid = u_map.get(u_key, 0)
+            if u_reid <= 0:
+                continue
+
+            uf = user_feat_map.get(u_key, {})
+            recs: List[List[Any]] = []
+            for ev in row.get("seq", []):
+                if not isinstance(ev, dict):
+                    continue
+                raw_i = ev.get(ITEM_ID_COL)
+                if raw_i is None:
+                    continue
+                i_key = str(raw_i)
+                i_reid = i_map.get(i_key, 0)
+                if i_reid <= 0:
+                    continue
+
+                itf = item_feat_map.get(i_key, {})
+                a = _safe_int(ev.get(ACTION_COL, 0), 0)
+                ts = _safe_int(ev.get(TIMESTAMP_COL, 0), 0)
+                recs.append([u_reid, i_reid, uf, itf, a, ts])
+
+            if sort_by_timestamp:
+                recs.sort(key=lambda x: _safe_int(x[5], 0))
+
+            offsets.append(f.tell())
+            f.write(json.dumps(recs, ensure_ascii=False).encode("utf-8") + b"\n")
+            written += 1
+            if written % 200000 == 0:
+                _log(f"写入 seq 进度: users={written}")
+
+    with open(out_offsets, "wb") as ff:
+        pickle.dump(offsets, ff)
+
+    return written
+
+
+def _extract_candidate_features(row: Dict[str, Any]) -> Dict[str, Any]:
+    """提取 candidate 的稀疏特征字典，兼容 features 嵌套和 feature_value 结构。"""
+    if not isinstance(row, dict):
+        return {}
+
+    if "features" in row and isinstance(row.get("features"), dict):
+        return _norm_feat_dict(row.get("features", {}))
+
+    out: Dict[str, Any] = {}
+    for fid in ITEM_SPARSE_FEAT_IDS:
+        if fid not in row:
+            continue
+        v = row.get(fid)
+        if isinstance(v, dict):
+            if "feature_value" in v:
+                out[fid] = v.get("feature_value")
+            elif "value" in v:
+                out[fid] = v.get("value")
+            else:
+                out[fid] = 0
+        else:
+            out[fid] = v
+
+    return _norm_feat_dict(out)
 
 
 def _write_indexer(path: Path, u_map: Dict[str, int], i_map: Dict[str, int], f_map: Dict[str, Dict[str, int]]) -> None:
-    obj = {
-        "u": u_map,
-        "i": i_map,
-        "f": f_map,
-    }
     with open(path, "wb") as f:
-        pickle.dump(obj, f)
+        pickle.dump({"u": u_map, "i": i_map, "f": f_map}, f)
 
 
-def _write_predict_set(path: Path, candidate_rows: List[Dict[str, Any]],
-                       creative_col: str, retrieval_col: str, features_col: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for r in candidate_rows:
-            creative = r.get(creative_col, None)
-            retrieval = r.get(retrieval_col, None)
-            feat = _norm_feat_dict(r.get(features_col, {}))
+def _write_predict_set_from_dir(dir_path: Path, out_path: Path) -> int:
+    """将 candidate 表转换为 infer.py 需要的 predict_set.jsonl。"""
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for r in _iter_records_from_dir(dir_path):
+            if not isinstance(r, dict):
+                continue
+            creative = r.get(CANDIDATE_ITEM_ID_COL)
+            retrieval = r.get(CANDIDATE_RETRIEVAL_ID_COL)
             if creative is None or retrieval is None:
                 continue
+            feat = _extract_candidate_features(r)
             line = {
                 "creative_id": str(creative),
                 "retrieval_id": _safe_int(retrieval, 0),
                 "features": feat,
             }
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            n += 1
+            if n % 200000 == 0:
+                _log(f"写入 predict_set 进度: rows={n}")
+    return n
 
 
 def _write_dummy_emb81(path: Path, item_raw_ids: Iterable[str]) -> None:
-    # 与项目读取逻辑兼容：creative_emb/emb_81_32.pkl，key 是 raw item id。
     emb = {}
     z = np.zeros((32,), dtype=np.float32)
     for rid in item_raw_ids:
@@ -488,153 +651,100 @@ def _write_dummy_emb81(path: Path, item_raw_ids: Iterable[str]) -> None:
 
 
 def main() -> None:
+    global VERBOSE
     args = parse_args()
+    VERBOSE = args.verbose
+    input_root = Path(args.input)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    input_root = Path(args.input)
-
-    train_rows: List[Dict[str, Any]]
-    predict_rows: List[Dict[str, Any]]
-    candidate_rows: List[Dict[str, Any]]
-
-    _log("stage 1/7: validate input")
+    _log("阶段 1/7：校验输入目录", force=True)
     if not (input_root / SEQ_DIR).exists():
         raise ValueError(f"missing seq directory: {(input_root / SEQ_DIR).as_posix()}")
+    _log(
+        "输入目录结构约定: "
+        f"{SEQ_DIR}/, {USER_FEAT_DIR}/, {ITEM_FEAT_DIR}/, 可选 {PREDICT_SEQ_DIR}/, 可选 {CANDIDATE_DIR}/"
+        , force=True
+    )
+    _log(
+        "输出文件结构: indexer.pkl, item_feat_dict.json, seq.jsonl, seq_offsets.pkl, "
+        "可选 predict_seq.jsonl/predict_seq_offsets.pkl, 可选 predict_set.jsonl"
+        , force=True
+    )
 
-    _log("stage 2/7: load feature side tables")
+    _log("阶段 2/7：加载 user/item 特征侧表", force=True)
     user_feat_map = _load_feature_map_from_dir(input_root / USER_FEAT_DIR, is_user=True)
     item_feat_map = _load_feature_map_from_dir(input_root / ITEM_FEAT_DIR, is_user=False)
 
-    _log("stage 3/7: load sequence events")
-    train_events = _load_events_from_seq_dir(
-        seq_dir=input_root / SEQ_DIR,
-        user_col=USER_ID_COL,
-        item_col=ITEM_ID_COL,
-        ts_col=TIMESTAMP_COL,
-        action_col=ACTION_COL,
-        user_feat_col=USER_FEAT_COL,
-        item_feat_col=ITEM_FEAT_COL,
-        user_feat_map=user_feat_map,
-        item_feat_map=item_feat_map,
-    )
-    train_rows = _events_to_rows(train_events)
+    _log("阶段 3/7：第一遍扫描序列 ID", force=True)
+    train_users, train_items, _ = _scan_seq_ids_from_dir(input_root / SEQ_DIR)
+    predict_users, predict_items = set(), set()
+    if (input_root / PREDICT_SEQ_DIR).exists():
+        predict_users, predict_items, _ = _scan_seq_ids_from_dir(input_root / PREDICT_SEQ_DIR)
+    elif args.strict:
+        raise ValueError(f"missing predict sequence directory: {(input_root / PREDICT_SEQ_DIR).as_posix()}")
 
-    if PREDICT_SEQ_DIR and (input_root / PREDICT_SEQ_DIR).exists():
-        predict_events = _load_events_from_seq_dir(
-            seq_dir=input_root / PREDICT_SEQ_DIR,
-            user_col=USER_ID_COL,
-            item_col=ITEM_ID_COL,
-            ts_col=TIMESTAMP_COL,
-            action_col=ACTION_COL,
-            user_feat_col=USER_FEAT_COL,
-            item_feat_col=ITEM_FEAT_COL,
-            user_feat_map=user_feat_map,
-            item_feat_map=item_feat_map,
-        )
-        predict_rows = _events_to_rows(predict_events)
-    else:
-        if args.strict:
-            raise ValueError(f"missing predict sequence directory: {(input_root / PREDICT_SEQ_DIR).as_posix()}")
-        predict_rows = []
-
-    if CANDIDATE_DIR and (input_root / CANDIDATE_DIR).exists():
-        candidate_rows = list(_iter_records_from_dir(input_root / CANDIDATE_DIR))
-    else:
-        if args.strict:
-            raise ValueError(f"missing candidate directory: {(input_root / CANDIDATE_DIR).as_posix()}")
-        candidate_rows = []
-
-    print(f"Loaded rows: train={len(train_rows)}, predict={len(predict_rows)}, candidates={len(candidate_rows)}")
-
-    _log("stage 4/7: build id maps")
-    u_map, i_map = _build_id_maps(
-        train_rows=train_rows,
-        predict_rows=predict_rows,
-        user_col=USER_ID_COL,
-        item_col=ITEM_ID_COL,
-    )
+    _log("阶段 4/7：构建 user/item 重映射", force=True)
+    all_users = train_users | predict_users | set(user_feat_map.keys())
+    all_items = train_items | predict_items | set(item_feat_map.keys())
+    u_map = {u: idx + 1 for idx, u in enumerate(sorted(all_users))}
+    i_map = {i: idx + 1 for idx, i in enumerate(sorted(all_items))}
     print(f"Built id maps: users={len(u_map)}, items={len(i_map)}")
 
-    if args.strict and len(train_rows) == 0:
+    if args.strict and len(train_users) == 0:
         raise ValueError("no train rows parsed from seq directory")
 
-    _log("stage 5/7: build feature vocab + indexer + item feature dict")
-    f_map = _collect_feature_vocab(
-        rows=train_rows + predict_rows,
-        user_feat_col=USER_FEAT_COL,
-        item_feat_col=ITEM_FEAT_COL,
-    )
+    _log("阶段 5/7：构建特征词表并写 indexer/item_feat_dict", force=True)
+    f_map = _build_feature_vocab_from_maps(user_feat_map=user_feat_map, item_feat_map=item_feat_map)
     _write_indexer(out_dir / "indexer.pkl", u_map, i_map, f_map)
     print(f"Wrote {(out_dir / 'indexer.pkl').as_posix()}")
 
-    item_feat_dict = _build_item_feat_dict(
-        rows=train_rows + predict_rows,
-        item_col=ITEM_ID_COL,
-        item_feat_col=ITEM_FEAT_COL,
-        i_map=i_map,
-    )
-    with open(out_dir / "item_feat_dict.json", "w", encoding="utf-8") as f:
-        json.dump(item_feat_dict, f, ensure_ascii=False)
-    print(f"Wrote {(out_dir / 'item_feat_dict.json').as_posix()} (items with feats={len(item_feat_dict)})")
+    item_cnt = _write_item_feat_dict_from_map(out_dir / "item_feat_dict.json", i_map=i_map, item_feat_map=item_feat_map)
+    print(f"Wrote {(out_dir / 'item_feat_dict.json').as_posix()} (items with feats={item_cnt})")
 
-    _log("stage 6/7: build and write train sequences")
-    train_seqs = _build_user_sequences(
-        rows=train_rows,
+    _log("阶段 6/7：第二遍写训练序列文件", force=True)
+    train_written = _write_seq_from_hf_seq_dir(
+        seq_dir=input_root / SEQ_DIR,
+        out_jsonl=out_dir / "seq.jsonl",
+        out_offsets=out_dir / "seq_offsets.pkl",
         u_map=u_map,
         i_map=i_map,
-        user_col=USER_ID_COL,
-        item_col=ITEM_ID_COL,
-        ts_col=TIMESTAMP_COL,
-        action_col=ACTION_COL,
-        user_feat_col=USER_FEAT_COL,
-        item_feat_col=ITEM_FEAT_COL,
+        user_feat_map=user_feat_map,
+        item_feat_map=item_feat_map,
         sort_by_timestamp=SORT_BY_TIMESTAMP,
     )
-    _write_seq_and_offsets(
-        out_dir / "seq.jsonl",
-        out_dir / "seq_offsets.pkl",
-        train_seqs,
-    )
-    print(f"Wrote seq files for train users={len(train_seqs)}")
+    print(f"Wrote seq files for train users={train_written}")
 
-    if predict_rows:
-        _log("stage 7/7: build and write predict sequences")
-        predict_seqs = _build_user_sequences(
-            rows=predict_rows,
+    if (input_root / PREDICT_SEQ_DIR).exists():
+        _log("阶段 7/7：第二遍写推理序列文件", force=True)
+        pred_written = _write_seq_from_hf_seq_dir(
+            seq_dir=input_root / PREDICT_SEQ_DIR,
+            out_jsonl=out_dir / "predict_seq.jsonl",
+            out_offsets=out_dir / "predict_seq_offsets.pkl",
             u_map=u_map,
             i_map=i_map,
-            user_col=USER_ID_COL,
-            item_col=ITEM_ID_COL,
-            ts_col=TIMESTAMP_COL,
-            action_col=ACTION_COL,
-            user_feat_col=USER_FEAT_COL,
-            item_feat_col=ITEM_FEAT_COL,
+            user_feat_map=user_feat_map,
+            item_feat_map=item_feat_map,
             sort_by_timestamp=SORT_BY_TIMESTAMP,
         )
-        _write_seq_and_offsets(
-            out_dir / "predict_seq.jsonl",
-            out_dir / "predict_seq_offsets.pkl",
-            predict_seqs,
-        )
-        print(f"Wrote seq files for predict users={len(predict_seqs)}")
+        print(f"Wrote seq files for predict users={pred_written}")
 
-    if candidate_rows:
-        _write_predict_set(
-            out_dir / "predict_set.jsonl",
-            candidate_rows,
-            creative_col=CANDIDATE_CREATIVE_ID_COL,
-            retrieval_col=CANDIDATE_RETRIEVAL_ID_COL,
-            features_col=CANDIDATE_FEATURES_COL,
-        )
-        print(f"Wrote {(out_dir / 'predict_set.jsonl').as_posix()}")
+    if (input_root / CANDIDATE_DIR).exists():
+        n_candidate = _write_predict_set_from_dir(input_root / CANDIDATE_DIR, out_dir / "predict_set.jsonl")
+        print(f"Wrote {(out_dir / 'predict_set.jsonl').as_posix()} (rows={n_candidate})")
+    elif args.strict:
+        raise ValueError(f"missing candidate directory: {(input_root / CANDIDATE_DIR).as_posix()}")
+
+    if args.with_mm_emb:
+        _log("阶段 8/8：转换 mm_emb 到 creative_emb", force=True)
+        _convert_mm_emb_dir(input_root / MM_EMB_DIR, out_dir, strict=args.strict)
 
     if GENERATE_DUMMY_EMB81:
         p = out_dir / "creative_emb" / "emb_81_32.pkl"
         _write_dummy_emb81(p, i_map.keys())
         print(f"Wrote dummy mm emb file {(p).as_posix()}")
 
-    _log("all stages completed")
+    _log("全部阶段完成", force=True)
     print("Done")
 
 
