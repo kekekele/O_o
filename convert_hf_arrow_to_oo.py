@@ -231,6 +231,35 @@ def _iter_mm_source_files(mm_dir: Path) -> List[Path]:
     return sorted(files)
 
 
+def _collect_mm_sources(input_root: Path, selected_ids: set) -> Dict[str, List[Path]]:
+    """
+    自动收集 mm_emb 输入来源：
+    1) 新目录形态：--input/mm_emb_<fid>_<dim>
+    2) 兼容旧目录：--input/mm_emb
+    返回: fid -> files, 其中 '*' 表示旧目录中的混合来源。
+    """
+    source_map: Dict[str, List[Path]] = {fid: [] for fid in selected_ids}
+
+    # 新形态：每个 emb 一个独立目录
+    for fid in selected_ids:
+        dim = MM_EMB_DIMS.get(fid)
+        if dim is None:
+            continue
+        d = input_root / f"mm_emb_{fid}_{dim}"
+        if d.exists() and d.is_dir():
+            source_map[fid].extend(_iter_mm_source_files(d))
+
+    # 兼容旧形态：混合目录
+    legacy = input_root / MM_EMB_DIR
+    if legacy.exists() and legacy.is_dir():
+        mixed = _iter_mm_source_files(legacy)
+        if mixed:
+            source_map.setdefault("*", [])
+            source_map["*"].extend(mixed)
+
+    return source_map
+
+
 def _coerce_emb_vec(v: Any, dim: int) -> List[float]:
     if isinstance(v, dict):
         if "emb" in v:
@@ -258,7 +287,7 @@ def _coerce_emb_vec(v: Any, dim: int) -> List[float]:
     return out.tolist()
 
 
-def _extract_mm_emb_from_row(row: Any, selected_ids: set) -> Tuple[str, Dict[str, List[float]]]:
+def _extract_mm_emb_from_row(row: Any, selected_ids: set, source_fid_hint: str = "") -> Tuple[str, Dict[str, List[float]]]:
     if not isinstance(row, dict):
         return "", {}
 
@@ -304,10 +333,16 @@ def _extract_mm_emb_from_row(row: Any, selected_ids: set) -> Tuple[str, Dict[str
                     out[fid] = vec
                 break
 
+    # 若记录里没有显式 feat_id，但来源目录已明确对应某个 fid，则按目录 hint 兜底解析。
+    if source_fid_hint and source_fid_hint in selected_ids and source_fid_hint in MM_EMB_DIMS and source_fid_hint not in out:
+        vec = _coerce_emb_vec(row.get("emb", row.get("vector", row.get("value", None))), MM_EMB_DIMS[source_fid_hint])
+        if vec:
+            out[source_fid_hint] = vec
+
     return raw_id, out
 
 
-def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool, mm_emb_ids: List[str]) -> None:
+def _convert_mm_emb_dir(input_root: Path, out_dir: Path, strict: bool, mm_emb_ids: List[str]) -> None:
     """
     将 mm_emb 目录转换为项目可读取的 creative_emb 结构。
     - 81: 写为 emb_81_32.pkl
@@ -318,17 +353,15 @@ def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool, mm_emb_ids: L
         _log("未选择任何 mm_emb_id，跳过 mm_emb 转换", force=True)
         return
 
-    if not mm_dir.exists():
+    source_map = _collect_mm_sources(input_root, selected_ids)
+    total_files = sum(len(v) for v in source_map.values())
+    if total_files == 0:
         if strict:
-            raise ValueError(f"missing mm_emb directory: {mm_dir.as_posix()}")
-        _log(f"未找到 mm_emb 目录，跳过: {mm_dir.as_posix()}", force=True)
-        return
-
-    files = _iter_mm_source_files(mm_dir)
-    if len(files) == 0:
-        if strict:
-            raise ValueError(f"mm_emb has no supported files under: {mm_dir.as_posix()}")
-        _log(f"mm_emb 目录下无可解析文件，跳过: {mm_dir.as_posix()}", force=True)
+            raise ValueError(
+                f"mm_emb has no supported files under input root: {input_root.as_posix()} "
+                f"(expected mm_emb_<id>_<dim> or {MM_EMB_DIR}/)"
+            )
+        _log(f"输入目录下未找到可解析 mm_emb 文件，跳过: {input_root.as_posix()}", force=True)
         return
 
     creative_root = out_dir / "creative_emb"
@@ -338,19 +371,33 @@ def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool, mm_emb_ids: L
             continue
         (creative_root / f"emb_{fid}_{dim}").mkdir(parents=True, exist_ok=True)
 
-    _log(f"开始转换 mm_emb: files={len(files)}, selected_ids={sorted(selected_ids)}", force=True)
+    _log(
+        "开始转换 mm_emb: "
+        f"files={total_files}, selected_ids={sorted(selected_ids)}, "
+        f"source_dirs=mm_emb_<id>_<dim> + optional {MM_EMB_DIR}/",
+        force=True,
+    )
 
     emb81: Dict[str, np.ndarray] = {}
     per_fid_written = {fid: 0 for fid in MM_EMB_DIMS.keys()}
     total_rows = 0
 
-    for idx, src in enumerate(files, start=1):
-        _log(f"mm_emb 文件 {idx}/{len(files)}: {src.as_posix()}", force=True)
+    file_tasks: List[Tuple[str, Path]] = []
+    for fid, f_list in source_map.items():
+        for p in f_list:
+            file_tasks.append((fid, p))
+
+    for idx, (fid_hint, src) in enumerate(file_tasks, start=1):
+        _log(f"mm_emb 文件 {idx}/{len(file_tasks)}: {src.as_posix()} (hint={fid_hint})", force=True)
         writers: Dict[str, Any] = {}
         try:
-            for row in tqdm(_iter_records_from_file(src), desc=f"mm_emb {idx}/{len(files)}", dynamic_ncols=True, disable=not VERBOSE):
+            for row in tqdm(_iter_records_from_file(src), desc=f"mm_emb {idx}/{len(file_tasks)}", dynamic_ncols=True, disable=not VERBOSE):
                 total_rows += 1
-                raw_id, mm_map = _extract_mm_emb_from_row(row, selected_ids=selected_ids)
+                raw_id, mm_map = _extract_mm_emb_from_row(
+                    row,
+                    selected_ids=selected_ids,
+                    source_fid_hint=(fid_hint if fid_hint != "*" else ""),
+                )
                 if not raw_id or not mm_map:
                     continue
 
@@ -682,7 +729,7 @@ def main() -> None:
     if args.only_mm_emb:
         _log("仅 mm_emb 模式：跳过常规转换", force=True)
         _convert_mm_emb_dir(
-            input_root / MM_EMB_DIR,
+            input_root,
             out_dir,
             strict=args.strict,
             mm_emb_ids=args.mm_emb_ids,
@@ -771,7 +818,7 @@ def main() -> None:
     if args.with_mm_emb:
         _log("阶段 8/8：转换 mm_emb 到 creative_emb", force=True)
         _convert_mm_emb_dir(
-            input_root / MM_EMB_DIR,
+            input_root,
             out_dir,
             strict=args.strict,
             mm_emb_ids=args.mm_emb_ids,
