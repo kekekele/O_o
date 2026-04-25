@@ -1,11 +1,13 @@
 import argparse
 import json
 import pickle
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 
 # [2026-04-24] 新增：将 HuggingFace 数据转换为本项目可直接读取的数据目录结构。
@@ -46,6 +48,11 @@ SORT_BY_TIMESTAMP = True
 GENERATE_DUMMY_EMB81 = False
 
 # ================================================================
+
+
+def _log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,8 +129,10 @@ def _iter_records_from_dir(dir_path: Path) -> Iterable[Any]:
     if not dir_path.exists():
         return
     files = sorted([p for p in dir_path.rglob("*") if p.is_file()])
+    _log(f"scan dir={dir_path.as_posix()} files={len(files)}")
     for p in files:
         suffix = p.suffix.lower()
+        _log(f"reading file: {p.as_posix()}")
         if suffix == ".jsonl":
             for r in _iter_jsonl_file(p):
                 yield r
@@ -172,7 +181,11 @@ def _load_feature_map_from_dir(dir_path: Path, is_user: bool) -> Dict[str, Dict[
         id_candidates = ["item_id", "creative_id", "cid", "anonymous_cid", "i"]
         feat_candidates = ["item_feat", "features", "feat", "feature"]
 
+    role = "user" if is_user else "item"
+    _log(f"start load {role}_feat map from {dir_path.as_posix()}")
+    n_rows = 0
     for row in _iter_records_from_dir(dir_path):
+        n_rows += 1
         rid, feat = _extract_id_and_feat(row, id_candidates=id_candidates, feat_candidates=feat_candidates)
         if rid is None:
             continue
@@ -183,6 +196,9 @@ def _load_feature_map_from_dir(dir_path: Path, is_user: bool) -> Dict[str, Dict[
             for k, v in feat.items():
                 if k not in base:
                     base[k] = v
+        if n_rows % 200000 == 0:
+            _log(f"{role}_feat parsed rows={n_rows}, unique_ids={len(out)}")
+    _log(f"done load {role}_feat map: rows={n_rows}, unique_ids={len(out)}")
     return out
 
 
@@ -264,8 +280,11 @@ def _load_events_from_seq_dir(
     user_feat_map: Dict[str, Dict[str, Any]],
     item_feat_map: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    _log(f"start load events from {seq_dir.as_posix()}")
     events: List[Dict[str, Any]] = []
+    n_rows = 0
     for row in _iter_records_from_dir(seq_dir):
+        n_rows += 1
         ev = _row_to_event(
             row,
             user_col=user_col,
@@ -279,12 +298,15 @@ def _load_events_from_seq_dir(
         )
         if ev is not None:
             events.append(ev)
+        if n_rows % 200000 == 0:
+            _log(f"events parsed rows={n_rows}, valid_events={len(events)}")
+    _log(f"done load events: rows={n_rows}, valid_events={len(events)}")
     return events
 
 
 def _events_to_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
-    for e in events:
+    for e in tqdm(events, total=len(events), desc="events->rows", dynamic_ncols=True):
         out.append(
             {
                 "user_id": e.get("u_raw", None),
@@ -303,8 +325,8 @@ def _build_id_maps(train_rows: List[Dict[str, Any]], predict_rows: List[Dict[str
     users = set()
     items = set()
 
-    for rows in (train_rows, predict_rows):
-        for r in rows:
+    for rows, tag in ((train_rows, "train"), (predict_rows, "predict")):
+        for r in tqdm(rows, total=len(rows), desc=f"build_id_maps({tag})", dynamic_ncols=True):
             u = r.get(user_col, None)
             i = r.get(item_col, None)
             if u is not None:
@@ -325,7 +347,7 @@ def _collect_feature_vocab(rows: List[Dict[str, Any]], user_feat_col: str, item_
 
     values: Dict[str, set] = {k: set() for k in user_sparse + user_array + item_sparse}
 
-    for r in rows:
+    for r in tqdm(rows, total=len(rows), desc="collect_feature_vocab", dynamic_ncols=True):
         uf = _norm_feat_dict(r.get(user_feat_col, {}))
         itf = _norm_feat_dict(r.get(item_feat_col, {}))
 
@@ -358,7 +380,7 @@ def _collect_feature_vocab(rows: List[Dict[str, Any]], user_feat_col: str, item_
 def _build_item_feat_dict(rows: List[Dict[str, Any]], item_col: str, item_feat_col: str,
                           i_map: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
     item_feat_by_reid: Dict[int, Dict[str, Any]] = {}
-    for r in rows:
+    for r in tqdm(rows, total=len(rows), desc="build_item_feat_dict", dynamic_ncols=True):
         raw_i = r.get(item_col, None)
         if raw_i is None:
             continue
@@ -387,7 +409,7 @@ def _build_user_sequences(rows: List[Dict[str, Any]],
                           sort_by_timestamp: bool) -> Dict[int, List[List[Any]]]:
     seqs: Dict[int, List[List[Any]]] = defaultdict(list)
 
-    for r in rows:
+    for r in tqdm(rows, total=len(rows), desc="build_user_sequences", dynamic_ncols=True):
         raw_u = r.get(user_col, None)
         raw_i = r.get(item_col, None)
         if raw_u is None or raw_i is None:
@@ -417,7 +439,8 @@ def _write_seq_and_offsets(path_jsonl: Path, path_offsets: Path, seqs_by_uid: Di
     # 以 uid 升序写，每个 uid 一行。
     offsets: List[int] = []
     with open(path_jsonl, "wb") as f:
-        for uid in sorted(seqs_by_uid.keys()):
+        uids = sorted(seqs_by_uid.keys())
+        for uid in tqdm(uids, total=len(uids), desc=f"write {path_jsonl.name}", dynamic_ncols=True):
             offsets.append(f.tell())
             line = json.dumps(seqs_by_uid[uid], ensure_ascii=False).encode("utf-8") + b"\n"
             f.write(line)
@@ -475,12 +498,15 @@ def main() -> None:
     predict_rows: List[Dict[str, Any]]
     candidate_rows: List[Dict[str, Any]]
 
+    _log("stage 1/7: validate input")
     if not (input_root / SEQ_DIR).exists():
         raise ValueError(f"missing seq directory: {(input_root / SEQ_DIR).as_posix()}")
 
+    _log("stage 2/7: load feature side tables")
     user_feat_map = _load_feature_map_from_dir(input_root / USER_FEAT_DIR, is_user=True)
     item_feat_map = _load_feature_map_from_dir(input_root / ITEM_FEAT_DIR, is_user=False)
 
+    _log("stage 3/7: load sequence events")
     train_events = _load_events_from_seq_dir(
         seq_dir=input_root / SEQ_DIR,
         user_col=USER_ID_COL,
@@ -521,6 +547,7 @@ def main() -> None:
 
     print(f"Loaded rows: train={len(train_rows)}, predict={len(predict_rows)}, candidates={len(candidate_rows)}")
 
+    _log("stage 4/7: build id maps")
     u_map, i_map = _build_id_maps(
         train_rows=train_rows,
         predict_rows=predict_rows,
@@ -532,6 +559,7 @@ def main() -> None:
     if args.strict and len(train_rows) == 0:
         raise ValueError("no train rows parsed from seq directory")
 
+    _log("stage 5/7: build feature vocab + indexer + item feature dict")
     f_map = _collect_feature_vocab(
         rows=train_rows + predict_rows,
         user_feat_col=USER_FEAT_COL,
@@ -550,6 +578,7 @@ def main() -> None:
         json.dump(item_feat_dict, f, ensure_ascii=False)
     print(f"Wrote {(out_dir / 'item_feat_dict.json').as_posix()} (items with feats={len(item_feat_dict)})")
 
+    _log("stage 6/7: build and write train sequences")
     train_seqs = _build_user_sequences(
         rows=train_rows,
         u_map=u_map,
@@ -570,6 +599,7 @@ def main() -> None:
     print(f"Wrote seq files for train users={len(train_seqs)}")
 
     if predict_rows:
+        _log("stage 7/7: build and write predict sequences")
         predict_seqs = _build_user_sequences(
             rows=predict_rows,
             u_map=u_map,
@@ -604,6 +634,7 @@ def main() -> None:
         _write_dummy_emb81(p, i_map.keys())
         print(f"Wrote dummy mm emb file {(p).as_posix()}")
 
+    _log("all stages completed")
     print("Done")
 
 
