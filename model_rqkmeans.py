@@ -28,8 +28,46 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+# [2026-04-24] 设备兼容改造：可选导入 torch_npu；未安装时保持原行为。
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
+
 
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+
+
+# [2026-04-24] 设备兼容改造：统一设备检测与上下文封装，不改变算法逻辑。
+def _npu_available() -> bool:
+    return hasattr(torch, 'npu') and torch.npu.is_available()
+
+
+def _resolve_runtime_device(device_str: str) -> torch.device:
+    d = str(device_str).lower()
+    if d == 'cpu':
+        return torch.device('cpu')
+    if d.startswith('cuda'):
+        return torch.device(device_str) if torch.cuda.is_available() else torch.device('cpu')
+    if d.startswith('npu'):
+        return torch.device(device_str) if _npu_available() else torch.device('cpu')
+    return torch.device('cpu')
+
+
+def _autocast_ctx(device: torch.device, dtype):
+    if dtype is None:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def _empty_cache(device: torch.device):
+    if device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == 'npu' and _npu_available():
+        try:
+            torch.npu.empty_cache()
+        except Exception:
+            pass
 
 # ---------- orjson 优先 ----------
 try:
@@ -436,13 +474,14 @@ class ResidualKMeansStream(torch.nn.Module):
         self.epochs = int(streaming_epochs)
         self.bs = int(streaming_batch_size)
         self.eval_bs = int(streaming_eval_bs)
-        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+        self.device = _resolve_runtime_device(device)
         self.tol = float(tolerance)
         self.seed = int(seed)
         self.log_file = log_file
         self.writer = writer
         self.verbose = bool(verbose)
         self.total_vectors = total_vectors
+        # [2026-04-24] 保持既有行为：自动混合精度仍仅在 CUDA 上默认开启。
         self.autocast_dtype = torch.bfloat16 if self.device.type == "cuda" else None
         self.codebooks: List[torch.Tensor] = []
         self._last_fit_info = {}
@@ -572,7 +611,7 @@ class ResidualKMeansStream(torch.nn.Module):
 
             for rids, vecs in stream.iter_batches(batch_size=self.bs, shuffle_files=True, seed=self.seed + ep):
                 res = self._compute_residual(vecs, rids, prev_cbs_dev, sid_mmaps_prev, device=device)
-                with (torch.autocast(device_type='cuda', dtype=self.autocast_dtype) if self.autocast_dtype else contextlib.nullcontext()):
+                with _autocast_ctx(device, self.autocast_dtype):
                     dists = _pairwise_sq_dists(res, centers, force_fp32=False)
                 labels = torch.argmin(dists, dim=1)
                 cnts.index_add_(0, labels, torch.ones_like(labels, dtype=torch.float32))
@@ -610,8 +649,7 @@ class ResidualKMeansStream(torch.nn.Module):
                     self._log(f"[RKMeans/stream] L{layer_idx+1} early-stop at epoch={ep} (delta < {self.tol})")
                 break
 
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        _empty_cache(device)
 
         return centers.detach().to('cpu', dtype=torch.float32)
 
@@ -648,7 +686,7 @@ class ResidualKMeansStream(torch.nn.Module):
         for rids, vecs in stream.iter_batches(batch_size=self.eval_bs, shuffle_files=False, seed=self.seed + 777):
             res = self._compute_residual(vecs, rids, prev_cbs_dev, sid_mmaps_prev, device=device)
 
-            with (torch.autocast(device_type='cuda', dtype=self.autocast_dtype) if self.autocast_dtype else contextlib.nullcontext()):
+            with _autocast_ctx(device, self.autocast_dtype):
                 dists = _pairwise_sq_dists(res, cb, force_fp32=False)
             labels = torch.argmin(dists, dim=1)
 
@@ -712,8 +750,7 @@ class ResidualKMeansStream(torch.nn.Module):
             "Nv": int(Nv),
         }
 
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        _empty_cache(device)
 
         return metrics
 

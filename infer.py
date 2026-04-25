@@ -10,8 +10,44 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# [2026-04-24] 设备兼容改造：可选导入 torch_npu；未安装时保持原行为。
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
+
 from dataset import MyTestDataset, save_emb
 from model import BaselineModel
+
+
+# [2026-04-24] 设备兼容改造：统一设备检测与解析，不改变 CUDA/CPU 既有逻辑。
+def _npu_available() -> bool:
+    return hasattr(torch, 'npu') and torch.npu.is_available()
+
+
+def _resolve_runtime_device(device_str: str) -> torch.device:
+    d = str(device_str).lower()
+    if d == 'cpu':
+        return torch.device('cpu')
+    if d.startswith('cuda'):
+        return torch.device(device_str) if torch.cuda.is_available() else torch.device('cpu')
+    if d.startswith('npu'):
+        return torch.device(device_str) if _npu_available() else torch.device('cpu')
+    return torch.device('cpu')
+
+
+def _pin_memory_for_device(device: torch.device) -> bool:
+    return device.type in ('cuda', 'npu')
+
+
+def _empty_cache(device: torch.device):
+    if device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == 'npu' and _npu_available():
+        try:
+            torch.npu.empty_cache()
+        except Exception:
+            pass
 
 
 def get_ckpt_path():
@@ -375,14 +411,12 @@ def batched_topk_torch(
             best_indices = torch.gather(comb_indices, 1, sel)
 
             del sims, sims32, block_scores, block_pos, block_indices, comb_scores, comb_indices, sel
-            if on_cuda:
-                torch.cuda.empty_cache()
+            _empty_cache(device)
 
         out_indices[q_start:q_end] = best_indices.cpu()
 
         del q_chunk, best_scores, best_indices
-        if on_cuda:
-            torch.cuda.empty_cache()
+        _empty_cache(device)
 
     return out_indices
 
@@ -390,13 +424,14 @@ def batched_topk_torch(
 def infer():
     args = get_args()
     torch.manual_seed(args.seed)
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
+    device = _resolve_runtime_device(args.device)
+    args.device = str(device)
 
     # 设定分块默认值
     if args.torch_query_bs is None:
-        args.torch_query_bs = 1024 if device.type == 'cuda' else 256
+        args.torch_query_bs = 1024 if device.type in ('cuda', 'npu') else 256
     if args.torch_item_bs is None:
-        args.torch_item_bs = 16384 if device.type == 'cuda' else 8192
+        args.torch_item_bs = 16384 if device.type in ('cuda', 'npu') else 8192
 
     data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
@@ -406,7 +441,7 @@ def infer():
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=test_dataset.collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=_pin_memory_for_device(device),
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=4
     )

@@ -14,6 +14,12 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 
+# [2026-04-24] 设备兼容改造：可选导入 torch_npu；未安装时保持原行为。
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
+
 from dataset import MyDataset
 from model import BaselineModel
 
@@ -65,13 +71,55 @@ def get_args():
     return args
 
 
+# [2026-04-24] 设备兼容改造：统一设备检测与解析，不改变 CUDA/CPU 既有逻辑。
+def _npu_available() -> bool:
+    return hasattr(torch, 'npu') and torch.npu.is_available()
+
+
+def _resolve_runtime_device(device_str: str) -> torch.device:
+    d = str(device_str).lower()
+    if d == 'cpu':
+        return torch.device('cpu')
+    if d.startswith('cuda'):
+        return torch.device(device_str) if torch.cuda.is_available() else torch.device('cpu')
+    if d.startswith('npu'):
+        return torch.device(device_str) if _npu_available() else torch.device('cpu')
+    return torch.device('cpu')
+
+
+def _pin_memory_for_device(device: torch.device) -> bool:
+    return device.type in ('cuda', 'npu')
+
+
+def _autocast_ctx(device_type: str, dtype, enabled: bool):
+    if not enabled:
+        return torch.autocast(device_type='cpu', enabled=False)
+    return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+
+
+def _build_grad_scaler(device_type: str, enabled: bool):
+    # 兼容不同 PyTorch 版本：优先 torch.amp.GradScaler，失败则回退 CUDA 旧接口。
+    try:
+        return torch.amp.GradScaler(device_type, enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    # [2026-04-24] 设备兼容改造：NPU 可用时补充种子设置。
+    if _npu_available():
+        try:
+            torch.npu.manual_seed(seed)
+            torch.npu.manual_seed_all(seed)
+        except Exception:
+            pass
 
 
 def worker_init_fn(worker_id):
@@ -248,7 +296,7 @@ def evaluate_hr_ndcg10_and_score(model, valid_loader, device, amp_enabled: bool,
         next_token_type = next_token_type.to(device)
         next_action_type = next_action_type.to(device)
 
-        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+        with _autocast_ctx(device.type, amp_dtype, amp_enabled):
             pos_embs, neg_embs, log_feats = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type,
                 seq_feat, pos_feat, neg_feat, seq_ts
@@ -298,9 +346,11 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
+    runtime_device = _resolve_runtime_device(args.device)
+    args.device = str(runtime_device)
 
     # CUDA/TF32 设置（在支持的 NVIDIA GPU 上进一步加速）
-    if torch.cuda.is_available():
+    if runtime_device.type == 'cuda' and torch.cuda.is_available():
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -309,7 +359,8 @@ if __name__ == '__main__':
             pass
 
     # 解析 AMP 配置
-    use_cuda = torch.cuda.is_available() and str(args.device).startswith('cuda')
+    use_cuda = (runtime_device.type == 'cuda') and torch.cuda.is_available()
+    # [2026-04-24] 设备兼容改造：保持既有行为（AMP 仍仅在 CUDA 自动开启）。
     if args.amp == 'off' or not use_cuda:
         amp_enabled = False
         amp_dtype = None
@@ -391,7 +442,7 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,  # 使用原始 dataset 的 collate_fn
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=_pin_memory_for_device(runtime_device),
         prefetch_factor=4
     )
     val_loader = DataLoader(
@@ -401,17 +452,17 @@ if __name__ == '__main__':
         num_workers=min(8, num_workers),
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=_pin_memory_for_device(runtime_device),
         prefetch_factor=2
     )
 
     # 模型
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(runtime_device)
 
     # 加载全局 logQ（供难样本修正）
-    device_t = torch.device(args.device)
+    device_t = runtime_device
     def _load_item_logQ_for_train(dataset, device: torch.device):
         """
         优先从 USER_CACHE_PATH / TRAIN_CKPT_PATH / 数据目录 读取 item_logQ.npy；
@@ -485,7 +536,7 @@ if __name__ == '__main__':
     epoch_start_idx = 1
     if args.state_dict_path is not None:
         try:
-            model.load_state_dict(torch.load(args.state_dict_path, map_location=torch.device(args.device)))
+            model.load_state_dict(torch.load(args.state_dict_path, map_location=runtime_device))
             tail = args.state_dict_path[args.state_dict_path.find('epoch=') + 6:]
             epoch_start_idx = int(tail[: tail.find('.')]) + 1
         except Exception as e:
@@ -503,9 +554,9 @@ if __name__ == '__main__':
 
     # AMP GradScaler（bf16 不需要缩放；fp16 需要）
     if amp_enabled and amp_dtype == torch.float16:
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        scaler = _build_grad_scaler(runtime_device.type, enabled=True)
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        scaler = _build_grad_scaler(runtime_device.type, enabled=False)
 
     # 早停相关（基于 score 最大化）
     best_score = float('-inf')
@@ -541,7 +592,7 @@ if __name__ == '__main__':
                     neg_feat_ssl1, neg_feat_ssl2 = neg_feat, neg_feat
                     neg_ssl1, neg_ssl2 = neg, neg
 
-                device_t = args.device
+                device_t = runtime_device
                 seq = seq.to(device_t, non_blocking=True)
                 pos = pos.to(device_t, non_blocking=True)
                 neg = neg.to(device_t, non_blocking=True)
@@ -554,7 +605,7 @@ if __name__ == '__main__':
                 optimizer.zero_grad(set_to_none=True)
 
                 # AMP 前向与损失
-                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+                with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                     )
@@ -613,7 +664,7 @@ if __name__ == '__main__':
 
             # ===== 验证：HR@10、NDCG@10、score =====
             val_dict = evaluate_hr_ndcg10_and_score(
-                model, val_loader, device=torch.device(args.device),
+                model, val_loader, device=runtime_device,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype
             )
             writer.add_scalar('Val/HR@10', val_dict['hr10'], epoch)
