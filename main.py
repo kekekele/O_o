@@ -28,6 +28,14 @@ from model import BaselineModel
 # os.environ.setdefault("TRAIN_DATA_PATH", "./data/TencentGR_1k")
 # os.environ.setdefault("TRAIN_CKPT_PATH", "./result")
 
+
+def _ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _stage_log(msg: str) -> None:
+    print(f"[{_ts()}] {msg}", flush=True)
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -66,6 +74,7 @@ def get_args():
     parser.add_argument('--ssl_alpha', default=0.5, type=float, help='SSL 损失权重alpha')
     parser.add_argument('--ssl_mask_ratio', default=0.6, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
     parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
+    parser.add_argument('--log_interval', default=50, type=int, help='训练心跳日志间隔（step）')
 
     args = parser.parse_args()
     return args
@@ -338,6 +347,7 @@ def evaluate_hr_ndcg10_and_score(model, valid_loader, device, amp_enabled: bool,
 
 
 if __name__ == '__main__':
+    _stage_log("训练进程启动")
     # 路径与日志
     Path(os.environ.get('TRAIN_LOG_PATH')).mkdir(parents=True, exist_ok=True)
     Path(os.environ.get('TRAIN_TF_EVENTS_PATH')).mkdir(parents=True, exist_ok=True)
@@ -346,8 +356,10 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
+    _stage_log(f"参数解析完成: device={args.device}, batch_size={args.batch_size}, epochs={args.num_epochs}")
     runtime_device = _resolve_runtime_device(args.device)
     args.device = str(runtime_device)
+    _stage_log(f"运行设备解析完成: {runtime_device}")
 
     # CUDA/TF32 设置（在支持的 NVIDIA GPU 上进一步加速）
     if runtime_device.type == 'cuda' and torch.cuda.is_available():
@@ -376,9 +388,13 @@ if __name__ == '__main__':
 
     # 固定随机种子
     set_seed(args.seed)
+    _stage_log(f"随机种子设置完成: seed={args.seed}")
 
     # 数据集
+    _stage_log(f"开始加载数据集: {data_path}")
+    t_dataset = time.time()
     dataset = MyDataset(data_path, args)
+    _stage_log(f"数据集加载完成: users={dataset.usernum}, items={dataset.itemnum}, samples={len(dataset)}, cost={time.time() - t_dataset:.2f}s")
 
     # 按 1% 划分验证集（可复现）
     N = len(dataset)
@@ -393,6 +409,7 @@ if __name__ == '__main__':
     train_dataset = Subset(dataset, train_indices.tolist())
     val_dataset = Subset(dataset, val_indices.tolist())
     print(f"Data split: total={N}, train={len(train_dataset)}, val={len(val_dataset)}")
+    _stage_log(f"数据集划分完成: train={len(train_dataset)}, val={len(val_dataset)}")
 
     # 在训练开始前，导出 item 点击分桶映射供推理使用（若已存在则复用，不重复生成）
     try:
@@ -455,11 +472,13 @@ if __name__ == '__main__':
         pin_memory=_pin_memory_for_device(runtime_device),
         prefetch_factor=2
     )
+    _stage_log(f"DataLoader 构建完成: train_steps={len(train_loader)}, val_steps={len(val_loader)}, workers={num_workers}")
 
     # 模型
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(runtime_device)
+    _stage_log("模型构建并搬运到设备完成")
 
     # 加载全局 logQ（供难样本修正）
     device_t = runtime_device
@@ -523,6 +542,7 @@ if __name__ == '__main__':
         return torch.from_numpy(logq_np).to(device=device, dtype=torch.float32)
 
     item_logQ_t = _load_item_logQ_for_train(dataset, device=device_t)
+    _stage_log("item_logQ 加载完成")
 
     # 模块初始化
     model.apply(init_weights)
@@ -568,8 +588,11 @@ if __name__ == '__main__':
         print("Inference only mode enabled. Skip training.")
     else:
         print(f"Start training (AMP: {'on' if amp_enabled else 'off'}, dtype={str(amp_dtype) if amp_enabled else 'fp32'})")
+        _stage_log(f"开始训练: amp_enabled={amp_enabled}, amp_dtype={str(amp_dtype) if amp_enabled else 'fp32'}")
         for epoch in range(epoch_start_idx, args.num_epochs + 1):
             model.train()
+            epoch_t0 = time.time()
+            _stage_log(f"Epoch {epoch} 开始")
             pbar = tqdm(
                 enumerate(train_loader),
                 total=len(train_loader),
@@ -581,6 +604,7 @@ if __name__ == '__main__':
 
             # 训练阶段
             for step, batch in pbar:
+                step_t0 = time.time()
                 # 兼容包含两条负样本 SSL 视图
                 if isinstance(batch, (list, tuple)) and len(batch) >= 14:
                     (seq, pos, neg, token_type, next_token_type, next_action_type,
@@ -660,12 +684,26 @@ if __name__ == '__main__':
                 writer.add_scalar('Mask/mask_rate_easy', stats['mask_rate_easy'], global_step)
                 writer.add_scalar('Mask/mask_rate_hard', stats['mask_rate_hard'], global_step)
 
+                if step == 0:
+                    _stage_log(f"Epoch {epoch} 首个 batch 完成, first_step_cost={time.time() - step_t0:.2f}s")
+                if args.log_interval > 0 and ((step + 1) % args.log_interval == 0 or (step + 1) == len(train_loader)):
+                    _stage_log(
+                        f"Epoch {epoch} step {step + 1}/{len(train_loader)} "
+                        f"loss={float(loss.item()):.6f} main={float(loss_main.item()):.6f} ssl={float(loss_ssl.item()):.6f} "
+                        f"lr={optimizer.param_groups[0]['lr']:.6e} step_cost={time.time() - step_t0:.2f}s"
+                    )
+
                 global_step += 1
 
             # ===== 验证：HR@10、NDCG@10、score =====
             val_dict = evaluate_hr_ndcg10_and_score(
                 model, val_loader, device=runtime_device,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype
+            )
+            _stage_log(
+                f"Epoch {epoch} 验证完成: hr10={val_dict['hr10']:.6f}, "
+                f"ndcg10={val_dict['ndcg10']:.6f}, score={val_dict['score']:.6f}, "
+                f"epoch_cost={time.time() - epoch_t0:.2f}s"
             )
             writer.add_scalar('Val/HR@10', val_dict['hr10'], epoch)
             writer.add_scalar('Val/NDCG@10', val_dict['ndcg10'], epoch)
