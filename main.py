@@ -114,6 +114,25 @@ def _build_grad_scaler(device_type: str, enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _bf16_supported(device_type: str) -> bool:
+    if device_type == 'cuda':
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            return False
+    if device_type == 'npu':
+        # Ascend 侧优先尝试官方查询接口；若不可用，默认允许 bf16（与 NPU 优先策略一致）。
+        try:
+            if hasattr(torch, 'npu'):
+                fn = getattr(torch.npu, 'is_bf16_supported', None)
+                if callable(fn):
+                    return bool(fn())
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -370,21 +389,27 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    # 解析 AMP 配置
-    use_cuda = (runtime_device.type == 'cuda') and torch.cuda.is_available()
-    # [2026-04-24] 设备兼容改造：保持既有行为（AMP 仍仅在 CUDA 自动开启）。
-    if args.amp == 'off' or not use_cuda:
+    # 解析 AMP 配置（CUDA/NPU 都可生效）
+    amp_available = runtime_device.type in ('cuda', 'npu')
+    if args.amp == 'off' or not amp_available:
         amp_enabled = False
         amp_dtype = None
     else:
-        # auto: 优先 bfloat16，不支持则回退到 float16
-        bf16_ok = torch.cuda.is_bf16_supported()
-        if args.amp == 'bf16' or (args.amp == 'auto' and bf16_ok):
+        bf16_ok = _bf16_supported(runtime_device.type)
+        if args.amp == 'bf16':
             amp_enabled = True
             amp_dtype = torch.bfloat16
-        else:
+        elif args.amp == 'fp16':
             amp_enabled = True
             amp_dtype = torch.float16
+        else:
+            # auto: 优先 bf16，不支持时回退 fp16
+            amp_enabled = True
+            amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+    _stage_log(
+        f"AMP 解析结果: request={args.amp}, enabled={amp_enabled}, "
+        f"dtype={str(amp_dtype) if amp_dtype is not None else 'fp32'}, device={runtime_device.type}"
+    )
 
     # 固定随机种子
     set_seed(args.seed)
