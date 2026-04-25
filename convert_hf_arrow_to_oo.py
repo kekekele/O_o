@@ -92,6 +92,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strict", action="store_true", help="Fail when optional folders are missing")
     p.add_argument("--verbose", action="store_true", help="Enable detailed progress logs")
     p.add_argument("--with-mm-emb", action="store_true", help="Convert mm_emb directory to creative_emb outputs")
+    p.add_argument(
+        "--mm-emb-ids",
+        nargs="+",
+        default=["81", "82", "83", "84", "85", "86"],
+        type=str,
+        choices=[str(s) for s in range(81, 87)],
+        help="Select which mm emb ids to convert, e.g. --mm-emb-ids 81 84",
+    )
+    p.add_argument(
+        "--only-mm-emb",
+        action="store_true",
+        help="Only convert mm_emb -> creative_emb; skip regular seq/user/item/candidate conversion",
+    )
     return p.parse_args()
 
 
@@ -245,7 +258,7 @@ def _coerce_emb_vec(v: Any, dim: int) -> List[float]:
     return out.tolist()
 
 
-def _extract_mm_emb_from_row(row: Any) -> Tuple[str, Dict[str, List[float]]]:
+def _extract_mm_emb_from_row(row: Any, selected_ids: set) -> Tuple[str, Dict[str, List[float]]]:
     if not isinstance(row, dict):
         return "", {}
 
@@ -263,7 +276,7 @@ def _extract_mm_emb_from_row(row: Any) -> Tuple[str, Dict[str, List[float]]]:
     feat_id = row.get("feat_id", None)
     if feat_id is not None and "emb" in row:
         fid = str(feat_id)
-        if fid in MM_EMB_DIMS:
+        if fid in MM_EMB_DIMS and fid in selected_ids:
             vec = _coerce_emb_vec(row.get("emb"), MM_EMB_DIMS[fid])
             if vec:
                 out[fid] = vec
@@ -276,12 +289,14 @@ def _extract_mm_emb_from_row(row: Any) -> Tuple[str, Dict[str, List[float]]]:
             fid = str(k)
             if fid.startswith("emb_"):
                 fid = fid.replace("emb_", "", 1)
-            if fid in MM_EMB_DIMS:
+            if fid in MM_EMB_DIMS and fid in selected_ids:
                 vec = _coerce_emb_vec(v, MM_EMB_DIMS[fid])
                 if vec:
                     out[fid] = vec
 
     for fid, dim in MM_EMB_DIMS.items():
+        if fid not in selected_ids:
+            continue
         for key in [f"emb_{fid}", fid, f"mm_emb_{fid}"]:
             if key in row:
                 vec = _coerce_emb_vec(row.get(key), dim)
@@ -292,12 +307,17 @@ def _extract_mm_emb_from_row(row: Any) -> Tuple[str, Dict[str, List[float]]]:
     return raw_id, out
 
 
-def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool) -> None:
+def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool, mm_emb_ids: List[str]) -> None:
     """
     将 mm_emb 目录转换为项目可读取的 creative_emb 结构。
     - 81: 写为 emb_81_32.pkl
     - 82~86: 写为 emb_<fid>_<dim>/part-xxxxx.json（每行一条）
     """
+    selected_ids = set(mm_emb_ids)
+    if not selected_ids:
+        _log("未选择任何 mm_emb_id，跳过 mm_emb 转换", force=True)
+        return
+
     if not mm_dir.exists():
         if strict:
             raise ValueError(f"missing mm_emb directory: {mm_dir.as_posix()}")
@@ -314,11 +334,11 @@ def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool) -> None:
     creative_root = out_dir / "creative_emb"
     creative_root.mkdir(parents=True, exist_ok=True)
     for fid, dim in MM_EMB_DIMS.items():
-        if fid == "81":
+        if fid == "81" or fid not in selected_ids:
             continue
         (creative_root / f"emb_{fid}_{dim}").mkdir(parents=True, exist_ok=True)
 
-    _log(f"开始转换 mm_emb: files={len(files)}", force=True)
+    _log(f"开始转换 mm_emb: files={len(files)}, selected_ids={sorted(selected_ids)}", force=True)
 
     emb81: Dict[str, np.ndarray] = {}
     per_fid_written = {fid: 0 for fid in MM_EMB_DIMS.keys()}
@@ -330,7 +350,7 @@ def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool) -> None:
         try:
             for row in tqdm(_iter_records_from_file(src), desc=f"mm_emb {idx}/{len(files)}", dynamic_ncols=True, disable=not VERBOSE):
                 total_rows += 1
-                raw_id, mm_map = _extract_mm_emb_from_row(row)
+                raw_id, mm_map = _extract_mm_emb_from_row(row, selected_ids=selected_ids)
                 if not raw_id or not mm_map:
                     continue
 
@@ -357,13 +377,14 @@ def _convert_mm_emb_dir(mm_dir: Path, out_dir: Path, strict: bool) -> None:
             for _, wf in writers.items():
                 wf.close()
 
-    emb81_path = creative_root / "emb_81_32.pkl"
-    if len(emb81) > 0:
-        with open(emb81_path, "wb") as f:
-            pickle.dump(emb81, f)
-        _log(f"写出 mm_emb 81 文件: {emb81_path.as_posix()} (items={len(emb81)})", force=True)
-    else:
-        _log("未解析到 emb_81 数据，未写 emb_81_32.pkl", force=True)
+    if "81" in selected_ids:
+        emb81_path = creative_root / "emb_81_32.pkl"
+        if len(emb81) > 0:
+            with open(emb81_path, "wb") as f:
+                pickle.dump(emb81, f)
+            _log(f"写出 mm_emb 81 文件: {emb81_path.as_posix()} (items={len(emb81)})", force=True)
+        else:
+            _log("未解析到 emb_81 数据，未写 emb_81_32.pkl", force=True)
 
     _log(
         "mm_emb 转换完成: "
@@ -658,6 +679,18 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.only_mm_emb:
+        _log("仅 mm_emb 模式：跳过常规转换", force=True)
+        _convert_mm_emb_dir(
+            input_root / MM_EMB_DIR,
+            out_dir,
+            strict=args.strict,
+            mm_emb_ids=args.mm_emb_ids,
+        )
+        _log("全部阶段完成", force=True)
+        print("Done")
+        return
+
     _log("阶段 1/7：校验输入目录", force=True)
     if not (input_root / SEQ_DIR).exists():
         raise ValueError(f"missing seq directory: {(input_root / SEQ_DIR).as_posix()}")
@@ -737,7 +770,12 @@ def main() -> None:
 
     if args.with_mm_emb:
         _log("阶段 8/8：转换 mm_emb 到 creative_emb", force=True)
-        _convert_mm_emb_dir(input_root / MM_EMB_DIR, out_dir, strict=args.strict)
+        _convert_mm_emb_dir(
+            input_root / MM_EMB_DIR,
+            out_dir,
+            strict=args.strict,
+            mm_emb_ids=args.mm_emb_ids,
+        )
 
     if GENERATE_DUMMY_EMB81:
         p = out_dir / "creative_emb" / "emb_81_32.pkl"
