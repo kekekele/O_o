@@ -36,6 +36,18 @@ def _ts() -> str:
 def _stage_log(msg: str) -> None:
     print(f"[{_ts()}] {msg}", flush=True)
 
+
+def _to_fp32_feat_dict(feat_dict):
+    if not isinstance(feat_dict, dict):
+        return feat_dict
+    out = {}
+    for k, v in feat_dict.items():
+        if torch.is_tensor(v):
+            out[k] = v.float()
+        else:
+            out[k] = v
+    return out
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -608,6 +620,7 @@ if __name__ == '__main__':
     epochs_no_improve = 0
 
     global_step = 0
+    skipped_nonfinite_steps = 0
 
     if args.inference_only:
         print("Inference only mode enabled. Skip training.")
@@ -623,8 +636,7 @@ if __name__ == '__main__':
                 total=len(train_loader),
                 desc=f"Train epoch {epoch}",
                 dynamic_ncols=True,
-                leave=False,
-                bar_format='{l_bar}{bar}{r_bar}\n',
+                leave=True,
             )
 
             # 训练阶段
@@ -653,30 +665,45 @@ if __name__ == '__main__':
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # AMP 前向与损失
+                # AMP 前向
                 with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
                     pos_embs, neg_embs, log_feats = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
                     )
-                    loss_main, stats = InfoNCE(
-                        pos_embs, neg_embs, log_feats, temperature=args.temperature,
-                        next_token_type=next_token_type, next_action_type=next_action_type,
-                        pos_ids=pos, item_logQ=item_logQ_t,
-                        filter_current_only=True, neg_ids=neg
-                    )
 
-                    # ====== SSL：对负样本特征两视图做对比 ======
-                    if args.ssl != 'none' and args.ssl_alpha > 0.0:
+                # 损失统一切回 fp32，降低 bf16 下对比学习 logits 溢出/失稳风险。
+                loss_main, stats = InfoNCE(
+                    pos_embs.float(), neg_embs.float(), log_feats.float(), temperature=args.temperature,
+                    next_token_type=next_token_type, next_action_type=next_action_type,
+                    pos_ids=pos, item_logQ=item_logQ_t.float(),
+                    filter_current_only=True, neg_ids=neg
+                )
+
+                # ====== SSL：对负样本特征两视图做对比 ======
+                if args.ssl != 'none' and args.ssl_alpha > 0.0:
+                    with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
                         z1 = model.feat2emb(neg_ssl1, neg_feat_ssl1, include_user=False)  # [B,L,D]
                         z2 = model.feat2emb(neg_ssl2, neg_feat_ssl2, include_user=False)  # [B,L,D]
-                        mask_ssl = (token_type == 1)
-                        if mask_ssl.dtype is not torch.bool:
-                            mask_ssl = mask_ssl.bool()
-                        loss_ssl = ssl_loss(z1[mask_ssl], z2[mask_ssl], temperature=args.temperature)
-                    else:
-                        loss_ssl = torch.zeros((), device=log_feats.device)
+                    mask_ssl = (token_type == 1)
+                    if mask_ssl.dtype is not torch.bool:
+                        mask_ssl = mask_ssl.bool()
+                    loss_ssl = ssl_loss(z1.float()[mask_ssl], z2.float()[mask_ssl], temperature=args.temperature)
+                else:
+                    loss_ssl = torch.zeros((), device=log_feats.device)
 
-                    loss = loss_main + float(args.ssl_alpha) * loss_ssl
+                loss = loss_main + float(args.ssl_alpha) * loss_ssl
+
+                if not torch.isfinite(loss).item():
+                    skipped_nonfinite_steps += 1
+                    _stage_log(
+                        f"Epoch {epoch} step {step + 1}/{len(train_loader)} 检测到非有限 loss，跳过更新: "
+                        f"loss={float(loss.detach().float().cpu().item())}, "
+                        f"main={float(loss_main.detach().float().cpu().item())}, "
+                        f"ssl={float(loss_ssl.detach().float().cpu().item())}, "
+                        f"skipped={skipped_nonfinite_steps}"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 # 反向与优化
                 if scaler.is_enabled():
