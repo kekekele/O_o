@@ -681,7 +681,7 @@ if __name__ == '__main__':
 
     global_step = 0
     skipped_nonfinite_steps = 0
-    step_debug_dir = Path(os.environ.get('TRAIN_LOG_PATH')) / "step_debug"
+    step_debug_dir = Path(os.environ.get('TRAIN_LOG_PATH') or "./logs") / "step_debug"
 
     if args.inference_only:
         print("Inference only mode enabled. Skip training.")
@@ -834,12 +834,53 @@ if __name__ == '__main__':
 
                 scheduler.step()
 
+                # 再做一次窗口内同步，覆盖反向/优化阶段的异步报错定位。
+                if debug_active and runtime_device.type == 'npu' and args.debug_sync_every > 0:
+                    if (global_step + 1) % args.debug_sync_every == 0:
+                        try:
+                            torch.npu.synchronize()
+                        except Exception as e:
+                            _stage_log(f"[DebugSync-PostStep] npu synchronize failed at step={global_step}: {e}")
+                            _dump_step_debug(step_debug_dir, {
+                                "global_step": global_step,
+                                "epoch": epoch,
+                                "step": step,
+                                "phase": "post_step_sync",
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                                "seq": _tensor_brief_stats(seq),
+                                "pos": _tensor_brief_stats(pos),
+                                "neg": _tensor_brief_stats(neg),
+                                "token_type": _tensor_brief_stats(token_type),
+                                "next_token_type": _tensor_brief_stats(next_token_type),
+                                "next_action_type": _tensor_brief_stats(next_action_type),
+                            })
+                            raise
+
                 # 日志
-                log_json = json.dumps(
-                    {'global_step': global_step, 'loss_main': float(loss_main.item()),
-                     'loss_ssl': float(loss_ssl.item()), 'loss_total': float(loss.item()),
-                     'epoch': epoch, 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
-                )
+                try:
+                    log_json = json.dumps(
+                        {'global_step': global_step, 'loss_main': float(loss_main.item()),
+                         'loss_ssl': float(loss_ssl.item()), 'loss_total': float(loss.item()),
+                         'epoch': epoch, 'LR': optimizer.param_groups[0]['lr'], 'time': time.time()}
+                    )
+                except Exception as e:
+                    _stage_log(f"[DebugLog] loss.item() failed at step={global_step}: {e}")
+                    _dump_step_debug(step_debug_dir, {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "step": step,
+                        "phase": "log_item",
+                        "error": str(e),
+                        "traceback": traceback.format_exc(),
+                        "seq": _tensor_brief_stats(seq),
+                        "pos": _tensor_brief_stats(pos),
+                        "neg": _tensor_brief_stats(neg),
+                        "token_type": _tensor_brief_stats(token_type),
+                        "next_token_type": _tensor_brief_stats(next_token_type),
+                        "next_action_type": _tensor_brief_stats(next_action_type),
+                    })
+                    raise
                 log_file.write(log_json + '\n')
                 log_file.flush()
                 writer.add_scalar('Loss/main', loss_main.item(), global_step)
