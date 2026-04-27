@@ -4,6 +4,7 @@ import os
 import math
 import time
 import random
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,56 @@ def _to_fp32_feat_dict(feat_dict):
             out[k] = v
     return out
 
+
+def _tensor_brief_stats(x: torch.Tensor):
+    if not torch.is_tensor(x):
+        return {"type": str(type(x))}
+    t = x.detach()
+    stat = {
+        "shape": list(t.shape),
+        "dtype": str(t.dtype),
+        "device": str(t.device),
+    }
+    try:
+        if t.numel() > 0:
+            if t.dtype.is_floating_point:
+                tf = t.float()
+                stat.update({
+                    "min": float(tf.min().item()),
+                    "max": float(tf.max().item()),
+                    "nan": int(torch.isnan(tf).sum().item()),
+                    "inf": int(torch.isinf(tf).sum().item()),
+                })
+            else:
+                stat.update({
+                    "min": int(t.min().item()),
+                    "max": int(t.max().item()),
+                })
+    except Exception as e:
+        stat["stat_error"] = str(e)
+    return stat
+
+
+def _in_debug_window(global_step: int, start_step: int, end_step: int) -> bool:
+    if start_step < 0:
+        return False
+    if global_step < start_step:
+        return False
+    if end_step >= 0 and global_step > end_step:
+        return False
+    return True
+
+
+def _dump_step_debug(log_dir: Path, payload: dict) -> None:
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        p = log_dir / f"step_debug_{payload.get('global_step', -1)}.json"
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        _stage_log(f"已写入调试快照: {p}")
+    except Exception as e:
+        _stage_log(f"写调试快照失败: {e}")
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -87,6 +138,10 @@ def get_args():
     parser.add_argument('--ssl_mask_ratio', default=0.6, type=float, help='RFM 域级掩蔽比例（传入 dataset）')
     parser.add_argument('--ssl_value_dropout', default=0.3, type=float, help='多值特征值级 dropout 概率（传入 dataset）')
     parser.add_argument('--log_interval', default=50, type=int, help='训练心跳日志间隔（step）')
+    parser.add_argument('--debug_start_step', default=-1, type=int, help='开启精细调试的起始 global_step（<0 关闭）')
+    parser.add_argument('--debug_end_step', default=-1, type=int, help='开启精细调试的结束 global_step（<0 表示不设上限）')
+    parser.add_argument('--debug_sync_every', default=1, type=int, help='调试窗口内每多少步做一次 npu synchronize（仅NPU）')
+    parser.add_argument('--debug_check_indices', action='store_true', help='调试窗口内检查 item/user 索引范围并打印异常')
 
     args = parser.parse_args()
     return args
@@ -391,6 +446,11 @@ if __name__ == '__main__':
     runtime_device = _resolve_runtime_device(args.device)
     args.device = str(runtime_device)
     _stage_log(f"运行设备解析完成: {runtime_device}")
+    if args.debug_start_step >= 0:
+        _stage_log(
+            f"调试窗口开启: start={args.debug_start_step}, end={args.debug_end_step}, "
+            f"sync_every={args.debug_sync_every}, check_indices={args.debug_check_indices}"
+        )
 
     # CUDA/TF32 设置（在支持的 NVIDIA GPU 上进一步加速）
     if runtime_device.type == 'cuda' and torch.cuda.is_available():
@@ -621,6 +681,7 @@ if __name__ == '__main__':
 
     global_step = 0
     skipped_nonfinite_steps = 0
+    step_debug_dir = Path(os.environ.get('TRAIN_LOG_PATH')) / "step_debug"
 
     if args.inference_only:
         print("Inference only mode enabled. Skip training.")
@@ -663,6 +724,36 @@ if __name__ == '__main__':
                 next_token_type = next_token_type.to(device_t, non_blocking=True)
                 next_action_type = next_action_type.to(device_t, non_blocking=True)
 
+                debug_active = _in_debug_window(global_step, args.debug_start_step, args.debug_end_step)
+
+                if debug_active and args.debug_check_indices:
+                    idx_errs = []
+                    try:
+                        seq_min, seq_max = int(seq.min().item()), int(seq.max().item())
+                        pos_min, pos_max = int(pos.min().item()), int(pos.max().item())
+                        neg_min, neg_max = int(neg.min().item()), int(neg.max().item())
+                        if seq_min < 0 or seq_max > model.item_num:
+                            idx_errs.append(f"seq index out of range: min={seq_min}, max={seq_max}, item_num={model.item_num}")
+                        if pos_min < 0 or pos_max > model.item_num:
+                            idx_errs.append(f"pos index out of range: min={pos_min}, max={pos_max}, item_num={model.item_num}")
+                        if neg_min < 0 or neg_max > model.item_num:
+                            idx_errs.append(f"neg index out of range: min={neg_min}, max={neg_max}, item_num={model.item_num}")
+                    except Exception as e:
+                        idx_errs.append(f"index check failed: {e}")
+
+                    if idx_errs:
+                        for em in idx_errs:
+                            _stage_log(f"[IndexCheck] {em}")
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "index_errors": idx_errs,
+                            "seq": _tensor_brief_stats(seq),
+                            "pos": _tensor_brief_stats(pos),
+                            "neg": _tensor_brief_stats(neg),
+                        })
+
                 optimizer.zero_grad(set_to_none=True)
 
                 # AMP 前向
@@ -704,6 +795,30 @@ if __name__ == '__main__':
                     )
                     optimizer.zero_grad(set_to_none=True)
                     continue
+
+                if debug_active and runtime_device.type == 'npu' and args.debug_sync_every > 0:
+                    if (global_step + 1) % args.debug_sync_every == 0:
+                        try:
+                            torch.npu.synchronize()
+                        except Exception as e:
+                            _stage_log(f"[DebugSync] npu synchronize failed at step={global_step}: {e}")
+                            _dump_step_debug(step_debug_dir, {
+                                "global_step": global_step,
+                                "epoch": epoch,
+                                "step": step,
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                                "seq": _tensor_brief_stats(seq),
+                                "pos": _tensor_brief_stats(pos),
+                                "neg": _tensor_brief_stats(neg),
+                                "token_type": _tensor_brief_stats(token_type),
+                                "next_token_type": _tensor_brief_stats(next_token_type),
+                                "next_action_type": _tensor_brief_stats(next_action_type),
+                                "loss_main": float(loss_main.detach().float().cpu().item()),
+                                "loss_ssl": float(loss_ssl.detach().float().cpu().item()),
+                                "loss": float(loss.detach().float().cpu().item()),
+                            })
+                            raise
 
                 # 反向与优化
                 if scaler.is_enabled():
