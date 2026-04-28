@@ -177,6 +177,33 @@ def _diag_log_feats_path(model, seq, token_type, seq_feat, seq_ts):
         out["traceback"] = traceback.format_exc()
     return out
 
+
+def _scan_nonfinite_params(model, max_items: int = 20):
+    out = []
+    try:
+        for name, p in model.named_parameters():
+            if p is None:
+                continue
+            pd = p.detach()
+            if not pd.dtype.is_floating_point:
+                continue
+            if not torch.isfinite(pd).all().item():
+                pf = pd.float()
+                out.append({
+                    "name": name,
+                    "shape": list(pd.shape),
+                    "dtype": str(pd.dtype),
+                    "nan": int(torch.isnan(pf).sum().item()),
+                    "inf": int(torch.isinf(pf).sum().item()),
+                    "min": float(torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
+                    "max": float(torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
+                })
+                if len(out) >= max_items:
+                    break
+    except Exception as e:
+        out.append({"scan_error": str(e)})
+    return out
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -883,6 +910,9 @@ if __name__ == '__main__':
 
                 if not torch.isfinite(log_feats).all().item():
                     _stage_log(f"[Forward] 检测到非有限 log_feats，step={global_step}")
+                    bad_params = _scan_nonfinite_params(model)
+                    if bad_params:
+                        _stage_log(f"[Forward] 检测到参数非有限，命中数量(截断)={len(bad_params)}")
                     _dump_step_debug(step_debug_dir, {
                         "global_step": global_step,
                         "epoch": epoch,
@@ -901,6 +931,7 @@ if __name__ == '__main__':
                         "pos_embs": _tensor_brief_stats(pos_embs),
                         "neg_embs": _tensor_brief_stats(neg_embs),
                         "log_feats": _tensor_brief_stats(log_feats),
+                        "nonfinite_params": bad_params,
                     })
 
                     # 自动二次定位：在同一 batch 上开启模型层级有限性检查，抓到首个出错阶段。

@@ -315,6 +315,7 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.maxlen = args.maxlen
         self.hidden_units = args.hidden_units
+        self.debug_check_model_finite = bool(getattr(args, 'debug_check_model_finite', False))
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.embedding_dim, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.embedding_dim, padding_idx=0)
@@ -406,6 +407,11 @@ class BaselineModel(torch.nn.Module):
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
 
+    def _check_finite_or_raise(self, x: torch.Tensor, name: str):
+        if self.debug_check_model_finite and torch.is_tensor(x):
+            if not torch.isfinite(x).all().item():
+                raise RuntimeError(f"non-finite in feat2emb: {name}")
+
     def feat2emb(self, seq, feature_batch, mask=None, include_user=False, seq_ts=None):
         """
         Args:
@@ -425,10 +431,13 @@ class BaselineModel(torch.nn.Module):
             item_mask = (mask == 1).to(self.dev)
             user_embedding = self.user_emb(user_mask * seq)
             item_embedding = self.item_emb(item_mask * seq)
+            self._check_finite_or_raise(user_embedding, "user_embedding")
+            self._check_finite_or_raise(item_embedding, "item_embedding")
             item_feat_list = [item_embedding]
             user_feat_list = [user_embedding]
         else:
             item_embedding = self.item_emb(seq)
+            self._check_finite_or_raise(item_embedding, "item_embedding")
             item_feat_list = [item_embedding]
 
         ft = feature_batch  # 预张量化特征
@@ -437,15 +446,24 @@ class BaselineModel(torch.nn.Module):
         # 仅保留普通 item 稀疏特征；交叉特征只在 user_item 路径启用
         for k, tens in ft.get('item_sparse', {}).items():
             if (k in self.ITEM_SPARSE_FEAT) or (include_user and (k in self.ITEM_CROSS_FEAT)):
-                item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
+                emb_k = self.sparse_emb[k](tens.to(self.dev))
+                self._check_finite_or_raise(emb_k, f"item_sparse[{k}]")
+                item_feat_list.append(emb_k)
         for k, tens in ft.get('item_array', {}).items():
-            item_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
+            emb_k = self.sparse_emb[k](tens.to(self.dev)).sum(2)
+            self._check_finite_or_raise(emb_k, f"item_array[{k}]")
+            item_feat_list.append(emb_k)
         for k, tens in ft.get('item_continual', {}).items():
-            item_feat_list.append(tens.to(self.dev).unsqueeze(2))
+            cont_k = tens.to(self.dev).unsqueeze(2)
+            self._check_finite_or_raise(cont_k, f"item_continual[{k}]")
+            item_feat_list.append(cont_k)
         for k in self.ITEM_EMB_FEAT:
             if k in ft.get('item_emb', {}):
                 t = ft['item_emb'][k].to(self.dev)
-                item_feat_list.append(self.emb_transform[k](t))
+                self._check_finite_or_raise(t, f"item_emb_input[{k}]")
+                emb_t = self.emb_transform[k](t)
+                self._check_finite_or_raise(emb_t, f"item_emb_transformed[{k}]")
+                item_feat_list.append(emb_t)
 
         # 将 hour / dow / weekend 作为“item 侧稀疏特征”拼到 user_item 路径
         if include_user and (seq_ts is not None):
@@ -463,22 +481,34 @@ class BaselineModel(torch.nn.Module):
             item_feat_list.append(self.hour_emb(hour_idx))
             item_feat_list.append(self.dow_emb(dow_idx))
             item_feat_list.append(self.weekend_emb(weekend_idx))
+            self._check_finite_or_raise(item_feat_list[-3], "hour_emb")
+            self._check_finite_or_raise(item_feat_list[-2], "dow_emb")
+            self._check_finite_or_raise(item_feat_list[-1], "weekend_emb")
 
         # user 特征（仅在 include_user=True 时使用）
         if include_user:
             for k, tens in ft.get('user_sparse', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)))
+                emb_k = self.sparse_emb[k](tens.to(self.dev))
+                self._check_finite_or_raise(emb_k, f"user_sparse[{k}]")
+                user_feat_list.append(emb_k)
             for k, tens in ft.get('user_array', {}).items():
-                user_feat_list.append(self.sparse_emb[k](tens.to(self.dev)).sum(2))
+                emb_k = self.sparse_emb[k](tens.to(self.dev)).sum(2)
+                self._check_finite_or_raise(emb_k, f"user_array[{k}]")
+                user_feat_list.append(emb_k)
             for k, tens in ft.get('user_continual', {}).items():
-                user_feat_list.append(tens.to(self.dev).unsqueeze(2))
+                cont_k = tens.to(self.dev).unsqueeze(2)
+                self._check_finite_or_raise(cont_k, f"user_continual[{k}]")
+                user_feat_list.append(cont_k)
 
         if include_user:
             all_user_item_emb = torch.concat(user_feat_list + item_feat_list, dim=-1)  # [B,S,D_user_item]
+            self._check_finite_or_raise(all_user_item_emb, "all_user_item_emb")
             seqs_emb = self.user_item_dnn(all_user_item_emb)
         else:
             all_item_emb = torch.concat(item_feat_list, dim=-1)                        # [B,S,D_item]
+            self._check_finite_or_raise(all_item_emb, "all_item_emb")
             seqs_emb = self.item_dnn(all_item_emb)
+        self._check_finite_or_raise(seqs_emb, "feat2emb_output")
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature, seq_ts):
@@ -491,11 +521,15 @@ class BaselineModel(torch.nn.Module):
         # 加入 seq_ts，使 hour/dow/weekend 作为 item 特征进入 user_item_dnn
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, seq_ts=seq_ts)
         seqs *= self.hidden_units ** 0.5
+        if self.debug_check_model_finite and (not torch.isfinite(seqs).all().item()):
+            raise RuntimeError("non-finite in seqs after feat2emb")
 
         # 仅保留绝对时间傅里叶特征作为加性偏置（padding 位置为 0）
         ts = seq_ts.to(self.dev).long()                         # [B,S]
         valid = (mask != 0).to(torch.bool).to(self.dev)         # [B,S]
         time_abs = self.time_abs_enc(ts) * valid.unsqueeze(-1)  # [B,S,H]
+        if self.debug_check_model_finite and (not torch.isfinite(time_abs).all().item()):
+            raise RuntimeError("non-finite in time_abs encoding")
         seqs += time_abs
 
         seqs = self.emb_dropout(seqs)
@@ -517,7 +551,11 @@ class BaselineModel(torch.nn.Module):
             seqs = self.attention_layers[i](
                 seqs, attn_mask=attention_mask, rel_ts_bias=rel_ts_bias
             )
+            if self.debug_check_model_finite and (not torch.isfinite(seqs).all().item()):
+                raise RuntimeError(f"non-finite after attention layer {i}")
         log_feats = F.normalize(seqs, dim=-1)
+        if self.debug_check_model_finite and (not torch.isfinite(log_feats).all().item()):
+            raise RuntimeError("non-finite after final normalize in log2feats")
         return log_feats
 
     def forward(
