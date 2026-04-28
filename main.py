@@ -231,6 +231,51 @@ def _scan_nonfinite_grads(model, max_items: int = 20):
         out.append({"scan_error": str(e)})
     return out
 
+
+def _sanitize_nonfinite_params(model, max_items: int = 20):
+    fixed = []
+    try:
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p is None:
+                    continue
+                pd = p.data
+                if not pd.dtype.is_floating_point:
+                    continue
+                if not torch.isfinite(pd).all().item():
+                    pd.copy_(torch.nan_to_num(pd, nan=0.0, posinf=1.0, neginf=-1.0))
+                    fixed.append(name)
+                    if len(fixed) >= max_items:
+                        break
+    except Exception:
+        pass
+    return fixed
+
+
+def _sanitize_optimizer_state_for_params(optimizer, model, param_names):
+    fixed_states = []
+    try:
+        name_to_param = {n: p for n, p in model.named_parameters()}
+        for name in param_names:
+            p = name_to_param.get(name, None)
+            if p is None:
+                continue
+            st = optimizer.state.get(p, None)
+            if not isinstance(st, dict):
+                continue
+            touched = False
+            for k, v in st.items():
+                if torch.is_tensor(v) and v.dtype.is_floating_point:
+                    if not torch.isfinite(v).all().item():
+                        with torch.no_grad():
+                            v.copy_(torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0))
+                        touched = True
+            if touched:
+                fixed_states.append(name)
+    except Exception:
+        pass
+    return fixed_states
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -937,6 +982,27 @@ if __name__ == '__main__':
                         "next_action_type": _tensor_brief_stats(next_action_type),
                         "nonfinite_params": bad_params,
                     })
+                    # 命中参数非有限的前向失败时，不直接中断训练；先修复参数并跳过当前 step。
+                    if bad_params or ('non-finite in feat2emb' in str(e)):
+                        fixed_names = _sanitize_nonfinite_params(model)
+                        fixed_state_names = _sanitize_optimizer_state_for_params(optimizer, model, fixed_names)
+                        _stage_log(
+                            f"[ForwardRecover] step={global_step} 已修复非有限参数数量(截断)={len(fixed_names)}，"
+                            f"已清洗优化器状态数量(截断)={len(fixed_state_names)}，跳过当前step继续训练"
+                        )
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "forward_nonfinite_param_recovered",
+                            "error": str(e),
+                            "fixed_params": fixed_names,
+                            "fixed_optimizer_states": fixed_state_names,
+                            "nonfinite_params_before_fix": bad_params,
+                        })
+                        skipped_nonfinite_steps += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     raise
 
                 if not torch.isfinite(log_feats).all().item():
