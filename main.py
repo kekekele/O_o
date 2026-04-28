@@ -151,6 +151,7 @@ def get_args():
     parser.add_argument('--debug_end_step', default=-1, type=int, help='开启精细调试的结束 global_step（<0 表示不设上限）')
     parser.add_argument('--debug_sync_every', default=1, type=int, help='调试窗口内每多少步做一次 npu synchronize（仅NPU）')
     parser.add_argument('--debug_check_indices', action='store_true', help='调试窗口内检查 item/user 索引范围并打印异常')
+    parser.add_argument('--debug_check_model_finite', action='store_true', help='调试时检查模型前向各层是否出现非有限值')
     parser.add_argument('--npu_safe_copy', action='store_true', help='NPU 排障模式：关闭 pin_memory，并使用阻塞式 .to() 拷贝')
 
     args = parser.parse_args()
@@ -773,10 +774,57 @@ if __name__ == '__main__':
                 optimizer.zero_grad(set_to_none=True)
 
                 # AMP 前向
-                with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
-                    pos_embs, neg_embs, log_feats = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
-                    )
+                try:
+                    with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
+                        pos_embs, neg_embs, log_feats = model(
+                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_ts
+                        )
+                except Exception as e:
+                    _stage_log(f"[Forward] model forward failed at step={global_step}: {e}")
+                    _dump_step_debug(step_debug_dir, {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "step": step,
+                        "phase": "forward_exception",
+                        "error": str(e),
+                        "traceback": traceback.format_exc(),
+                        "lr": float(optimizer.param_groups[0]['lr']),
+                        "temperature": float(args.temperature),
+                        "ssl_alpha": float(args.ssl_alpha),
+                        "seq": _tensor_brief_stats(seq),
+                        "pos": _tensor_brief_stats(pos),
+                        "neg": _tensor_brief_stats(neg),
+                        "seq_ts": _tensor_brief_stats(seq_ts),
+                        "token_type": _tensor_brief_stats(token_type),
+                        "next_token_type": _tensor_brief_stats(next_token_type),
+                        "next_action_type": _tensor_brief_stats(next_action_type),
+                    })
+                    raise
+
+                if not torch.isfinite(log_feats).all().item():
+                    _stage_log(f"[Forward] 检测到非有限 log_feats，step={global_step}")
+                    _dump_step_debug(step_debug_dir, {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "step": step,
+                        "phase": "non_finite_log_feats",
+                        "lr": float(optimizer.param_groups[0]['lr']),
+                        "temperature": float(args.temperature),
+                        "ssl_alpha": float(args.ssl_alpha),
+                        "seq": _tensor_brief_stats(seq),
+                        "pos": _tensor_brief_stats(pos),
+                        "neg": _tensor_brief_stats(neg),
+                        "seq_ts": _tensor_brief_stats(seq_ts),
+                        "token_type": _tensor_brief_stats(token_type),
+                        "next_token_type": _tensor_brief_stats(next_token_type),
+                        "next_action_type": _tensor_brief_stats(next_action_type),
+                        "pos_embs": _tensor_brief_stats(pos_embs),
+                        "neg_embs": _tensor_brief_stats(neg_embs),
+                        "log_feats": _tensor_brief_stats(log_feats),
+                    })
+                    skipped_nonfinite_steps += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 # 损失统一切回 fp32，降低 bf16 下对比学习 logits 溢出/失稳风险。
                 loss_main, stats = InfoNCE(
@@ -829,6 +877,7 @@ if __name__ == '__main__':
                         "seq": _tensor_brief_stats(seq),
                         "pos": _tensor_brief_stats(pos),
                         "neg": _tensor_brief_stats(neg),
+                        "seq_ts": _tensor_brief_stats(seq_ts),
                         "token_type": _tensor_brief_stats(token_type),
                         "next_token_type": _tensor_brief_stats(next_token_type),
                         "next_action_type": _tensor_brief_stats(next_action_type),
