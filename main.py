@@ -822,6 +822,37 @@ if __name__ == '__main__':
                         "neg_embs": _tensor_brief_stats(neg_embs),
                         "log_feats": _tensor_brief_stats(log_feats),
                     })
+
+                    # 自动二次定位：在同一 batch 上开启模型层级有限性检查，抓到首个出错阶段。
+                    try:
+                        if hasattr(model, 'debug_check_model_finite'):
+                            prev_flag = bool(model.debug_check_model_finite)
+                            model.debug_check_model_finite = True
+                            try:
+                                with torch.no_grad():
+                                    with _autocast_ctx(runtime_device.type, amp_dtype, amp_enabled):
+                                        _ = model(
+                                            seq, pos, neg, token_type, next_token_type, next_action_type,
+                                            seq_feat, pos_feat, neg_feat, seq_ts
+                                        )
+                            except Exception as e:
+                                _stage_log(f"[ForwardDiag] step={global_step} 层级有限性定位命中: {e}")
+                                _dump_step_debug(step_debug_dir, {
+                                    "global_step": global_step,
+                                    "epoch": epoch,
+                                    "step": step,
+                                    "phase": "non_finite_log_feats_diag",
+                                    "error": str(e),
+                                    "traceback": traceback.format_exc(),
+                                    "lr": float(optimizer.param_groups[0]['lr']),
+                                    "temperature": float(args.temperature),
+                                    "ssl_alpha": float(args.ssl_alpha),
+                                })
+                            finally:
+                                model.debug_check_model_finite = prev_flag
+                    except Exception as e:
+                        _stage_log(f"[ForwardDiag] 二次定位流程失败: {e}")
+
                     skipped_nonfinite_steps += 1
                     optimizer.zero_grad(set_to_none=True)
                     continue
