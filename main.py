@@ -99,6 +99,15 @@ def _dump_step_debug(log_dir: Path, payload: dict) -> None:
     except Exception as e:
         _stage_log(f"写调试快照失败: {e}")
 
+
+def _safe_scalar(x) -> float:
+    try:
+        if torch.is_tensor(x):
+            return float(x.detach().float().cpu().item())
+        return float(x)
+    except Exception:
+        return float('nan')
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -142,6 +151,7 @@ def get_args():
     parser.add_argument('--debug_end_step', default=-1, type=int, help='开启精细调试的结束 global_step（<0 表示不设上限）')
     parser.add_argument('--debug_sync_every', default=1, type=int, help='调试窗口内每多少步做一次 npu synchronize（仅NPU）')
     parser.add_argument('--debug_check_indices', action='store_true', help='调试窗口内检查 item/user 索引范围并打印异常')
+    parser.add_argument('--npu_safe_copy', action='store_true', help='NPU 排障模式：关闭 pin_memory，并使用阻塞式 .to() 拷贝')
 
     args = parser.parse_args()
     return args
@@ -163,8 +173,11 @@ def _resolve_runtime_device(device_str: str) -> torch.device:
     return torch.device('cpu')
 
 
-def _pin_memory_for_device(device: torch.device) -> bool:
-    return device.type in ('cuda', 'npu')
+def _pin_memory_for_device(device: torch.device, npu_safe_copy: bool = False) -> bool:
+    # NPU 排障模式下关闭 pin_memory，规避 copy_stream 异步拷贝链路不稳定。
+    if device.type == 'npu' and npu_safe_copy:
+        return False
+    return device.type == 'cuda'
 
 
 def _autocast_ctx(device_type: str, dtype, enabled: bool):
@@ -482,6 +495,8 @@ if __name__ == '__main__':
         f"AMP 解析结果: request={args.amp}, enabled={amp_enabled}, "
         f"dtype={str(amp_dtype) if amp_dtype is not None else 'fp32'}, device={runtime_device.type}"
     )
+    if runtime_device.type == 'npu':
+        _stage_log(f"NPU safe copy={'on' if args.npu_safe_copy else 'off'}")
 
     # 固定随机种子
     set_seed(args.seed)
@@ -556,7 +571,7 @@ if __name__ == '__main__':
         num_workers=num_workers,
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,  # 使用原始 dataset 的 collate_fn
-        pin_memory=_pin_memory_for_device(runtime_device),
+        pin_memory=_pin_memory_for_device(runtime_device, args.npu_safe_copy),
         prefetch_factor=4
     )
     val_loader = DataLoader(
@@ -566,7 +581,7 @@ if __name__ == '__main__':
         num_workers=min(8, num_workers),
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
         collate_fn=dataset.collate_fn,
-        pin_memory=_pin_memory_for_device(runtime_device),
+        pin_memory=_pin_memory_for_device(runtime_device, args.npu_safe_copy),
         prefetch_factor=2
     )
     _stage_log(f"DataLoader 构建完成: train_steps={len(train_loader)}, val_steps={len(val_loader)}, workers={num_workers}")
@@ -715,14 +730,15 @@ if __name__ == '__main__':
                     neg_ssl1, neg_ssl2 = neg, neg
 
                 device_t = runtime_device
-                seq = seq.to(device_t, non_blocking=True)
-                pos = pos.to(device_t, non_blocking=True)
-                neg = neg.to(device_t, non_blocking=True)
-                neg_ssl1 = neg_ssl1.to(device_t, non_blocking=True)
-                neg_ssl2 = neg_ssl2.to(device_t, non_blocking=True)
-                token_type = token_type.to(device_t, non_blocking=True)
-                next_token_type = next_token_type.to(device_t, non_blocking=True)
-                next_action_type = next_action_type.to(device_t, non_blocking=True)
+                npu_blocking = (device_t.type == 'npu' and args.npu_safe_copy)
+                seq = seq.to(device_t, non_blocking=(not npu_blocking))
+                pos = pos.to(device_t, non_blocking=(not npu_blocking))
+                neg = neg.to(device_t, non_blocking=(not npu_blocking))
+                neg_ssl1 = neg_ssl1.to(device_t, non_blocking=(not npu_blocking))
+                neg_ssl2 = neg_ssl2.to(device_t, non_blocking=(not npu_blocking))
+                token_type = token_type.to(device_t, non_blocking=(not npu_blocking))
+                next_token_type = next_token_type.to(device_t, non_blocking=(not npu_blocking))
+                next_action_type = next_action_type.to(device_t, non_blocking=(not npu_blocking))
 
                 debug_active = _in_debug_window(global_step, args.debug_start_step, args.debug_end_step)
 
@@ -786,13 +802,49 @@ if __name__ == '__main__':
 
                 if not torch.isfinite(loss).item():
                     skipped_nonfinite_steps += 1
+                    loss_v = _safe_scalar(loss)
+                    loss_main_v = _safe_scalar(loss_main)
+                    loss_ssl_v = _safe_scalar(loss_ssl)
                     _stage_log(
                         f"Epoch {epoch} step {step + 1}/{len(train_loader)} 检测到非有限 loss，跳过更新: "
-                        f"loss={float(loss.detach().float().cpu().item())}, "
-                        f"main={float(loss_main.detach().float().cpu().item())}, "
-                        f"ssl={float(loss_ssl.detach().float().cpu().item())}, "
+                        f"loss={loss_v}, "
+                        f"main={loss_main_v}, "
+                        f"ssl={loss_ssl_v}, "
                         f"skipped={skipped_nonfinite_steps}"
                     )
+                    _dump_step_debug(step_debug_dir, {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "step": step,
+                        "phase": "non_finite_loss",
+                        "loss": loss_v,
+                        "loss_main": loss_main_v,
+                        "loss_ssl": loss_ssl_v,
+                        "loss_isfinite": bool(torch.isfinite(loss).item()),
+                        "loss_main_isfinite": bool(torch.isfinite(loss_main).item()),
+                        "loss_ssl_isfinite": bool(torch.isfinite(loss_ssl).item()),
+                        "lr": float(optimizer.param_groups[0]['lr']),
+                        "temperature": float(args.temperature),
+                        "ssl_alpha": float(args.ssl_alpha),
+                        "seq": _tensor_brief_stats(seq),
+                        "pos": _tensor_brief_stats(pos),
+                        "neg": _tensor_brief_stats(neg),
+                        "token_type": _tensor_brief_stats(token_type),
+                        "next_token_type": _tensor_brief_stats(next_token_type),
+                        "next_action_type": _tensor_brief_stats(next_action_type),
+                        "pos_embs": _tensor_brief_stats(pos_embs),
+                        "neg_embs": _tensor_brief_stats(neg_embs),
+                        "log_feats": _tensor_brief_stats(log_feats),
+                        "diag_stats": {
+                            "mean_pos_sim": float(stats.get('mean_pos_sim', 0.0)),
+                            "mean_neg_sim": float(stats.get('mean_neg_sim', 0.0)),
+                            "mean_hard_neg_sim": float(stats.get('mean_hard_neg_sim', 0.0)),
+                            "mask_rate_easy": float(stats.get('mask_rate_easy', 0.0)),
+                            "mask_rate_hard": float(stats.get('mask_rate_hard', 0.0)),
+                        },
+                        "item_pos_count": int((next_token_type == 1).sum().item()),
+                        "click_count": int((next_action_type == 1).sum().item()),
+                    })
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
