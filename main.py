@@ -593,6 +593,10 @@ if __name__ == '__main__':
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(runtime_device)
     _stage_log("模型构建并搬运到设备完成")
+    if not hasattr(model, 'debug_check_model_finite'):
+        # 兼容旧版模型代码：运行时补齐诊断开关属性，避免主循环诊断分支被跳过。
+        model.debug_check_model_finite = bool(getattr(args, 'debug_check_model_finite', False))
+        _stage_log("检测到模型缺少 debug_check_model_finite，已在运行时注入该属性")
     try:
         _stage_log(
             f"模型来源: class={model.__class__.__module__}.{model.__class__.__name__}, "
