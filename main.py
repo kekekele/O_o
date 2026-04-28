@@ -204,6 +204,33 @@ def _scan_nonfinite_params(model, max_items: int = 20):
         out.append({"scan_error": str(e)})
     return out
 
+
+def _scan_nonfinite_grads(model, max_items: int = 20):
+    out = []
+    try:
+        for name, p in model.named_parameters():
+            if p is None or p.grad is None:
+                continue
+            gd = p.grad.detach()
+            if not gd.dtype.is_floating_point:
+                continue
+            if not torch.isfinite(gd).all().item():
+                gf = gd.float()
+                out.append({
+                    "name": name,
+                    "shape": list(gd.shape),
+                    "dtype": str(gd.dtype),
+                    "nan": int(torch.isnan(gf).sum().item()),
+                    "inf": int(torch.isinf(gf).sum().item()),
+                    "min": float(torch.nan_to_num(gf, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
+                    "max": float(torch.nan_to_num(gf, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
+                })
+                if len(out) >= max_items:
+                    break
+    except Exception as e:
+        out.append({"scan_error": str(e)})
+    return out
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -888,6 +915,9 @@ if __name__ == '__main__':
                         )
                 except Exception as e:
                     _stage_log(f"[Forward] model forward failed at step={global_step}: {e}")
+                    bad_params = _scan_nonfinite_params(model)
+                    if bad_params:
+                        _stage_log(f"[Forward] 前向失败时检测到参数非有限，命中数量(截断)={len(bad_params)}")
                     _dump_step_debug(step_debug_dir, {
                         "global_step": global_step,
                         "epoch": epoch,
@@ -905,6 +935,7 @@ if __name__ == '__main__':
                         "token_type": _tensor_brief_stats(token_type),
                         "next_token_type": _tensor_brief_stats(next_token_type),
                         "next_action_type": _tensor_brief_stats(next_action_type),
+                        "nonfinite_params": bad_params,
                     })
                     raise
 
@@ -1103,11 +1134,58 @@ if __name__ == '__main__':
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
+                    bad_grads = _scan_nonfinite_grads(model)
+                    if bad_grads:
+                        skipped_nonfinite_steps += 1
+                        _stage_log(
+                            f"[GradCheck] step={global_step} 检测到非有限梯度，跳过更新，命中数量(截断)={len(bad_grads)}"
+                        )
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "non_finite_grad_skip",
+                            "lr": float(optimizer.param_groups[0]['lr']),
+                            "loss": _safe_scalar(loss),
+                            "loss_main": _safe_scalar(loss_main),
+                            "loss_ssl": _safe_scalar(loss_ssl),
+                            "nonfinite_grads": bad_grads,
+                            "seq": _tensor_brief_stats(seq),
+                            "pos": _tensor_brief_stats(pos),
+                            "neg": _tensor_brief_stats(neg),
+                            "seq_ts": _tensor_brief_stats(seq_ts),
+                        })
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        continue
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    bad_grads = _scan_nonfinite_grads(model)
+                    if bad_grads:
+                        skipped_nonfinite_steps += 1
+                        _stage_log(
+                            f"[GradCheck] step={global_step} 检测到非有限梯度，跳过更新，命中数量(截断)={len(bad_grads)}"
+                        )
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "non_finite_grad_skip",
+                            "lr": float(optimizer.param_groups[0]['lr']),
+                            "loss": _safe_scalar(loss),
+                            "loss_main": _safe_scalar(loss_main),
+                            "loss_ssl": _safe_scalar(loss_ssl),
+                            "nonfinite_grads": bad_grads,
+                            "seq": _tensor_brief_stats(seq),
+                            "pos": _tensor_brief_stats(pos),
+                            "neg": _tensor_brief_stats(neg),
+                            "seq_ts": _tensor_brief_stats(seq_ts),
+                        })
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
 
