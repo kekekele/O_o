@@ -109,6 +109,74 @@ def _safe_scalar(x) -> float:
     except Exception:
         return float('nan')
 
+
+def _diag_log_feats_path(model, seq, token_type, seq_feat, seq_ts):
+    """
+    独立于 model.log2feats 内部开关的逐阶段诊断，定位首个出现非有限值的阶段。
+    """
+    out = {
+        "first_bad_stage": None,
+        "stages": {},
+    }
+    try:
+        with torch.no_grad():
+            seqs = model.feat2emb(seq, seq_feat, mask=token_type, include_user=True, seq_ts=seq_ts)
+            out["stages"]["feat2emb"] = _tensor_brief_stats(seqs)
+            if not torch.isfinite(seqs).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "feat2emb"
+
+            seqs = seqs * (model.hidden_units ** 0.5)
+            out["stages"]["scaled"] = _tensor_brief_stats(seqs)
+            if not torch.isfinite(seqs).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "scaled"
+
+            ts = seq_ts.to(model.dev).long()
+            key_query_valid = (token_type != 0).to(torch.bool).to(model.dev)
+            time_abs = model.time_abs_enc(ts) * key_query_valid.unsqueeze(-1)
+            out["stages"]["time_abs"] = _tensor_brief_stats(time_abs)
+            if not torch.isfinite(time_abs).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "time_abs"
+
+            seqs = seqs + time_abs
+            out["stages"]["after_time_add"] = _tensor_brief_stats(seqs)
+            if not torch.isfinite(seqs).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "after_time_add"
+
+            seqs = model.emb_dropout(seqs)
+            out["stages"]["after_dropout"] = _tensor_brief_stats(seqs)
+            if not torch.isfinite(seqs).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "after_dropout"
+
+            maxlen = seqs.shape[1]
+            ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=model.dev)
+            attention_mask_tril = torch.tril(ones_matrix)
+            attention_mask = (
+                attention_mask_tril.unsqueeze(0)
+                & key_query_valid.unsqueeze(2)
+                & key_query_valid.unsqueeze(1)
+            )
+            rel_ts_bias = model.rel_time_bias(ts, key_query_valid)
+            out["stages"]["rel_ts_bias"] = _tensor_brief_stats(rel_ts_bias)
+            if not torch.isfinite(rel_ts_bias).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "rel_ts_bias"
+
+            for i, layer in enumerate(model.attention_layers):
+                seqs = layer(seqs, attn_mask=attention_mask, rel_ts_bias=rel_ts_bias)
+                stage_name = f"attn_layer_{i}"
+                out["stages"][stage_name] = _tensor_brief_stats(seqs)
+                if not torch.isfinite(seqs).all().item() and out["first_bad_stage"] is None:
+                    out["first_bad_stage"] = stage_name
+                    break
+
+            log_feats = F.normalize(seqs, dim=-1)
+            out["stages"]["final_normalize"] = _tensor_brief_stats(log_feats)
+            if not torch.isfinite(log_feats).all().item() and out["first_bad_stage"] is None:
+                out["first_bad_stage"] = "final_normalize"
+    except Exception as e:
+        out["exception"] = str(e)
+        out["traceback"] = traceback.format_exc()
+    return out
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -882,6 +950,22 @@ if __name__ == '__main__':
                                 model.debug_check_model_finite = prev_flag
                                 model.train(prev_training)
                             _dump_step_debug(step_debug_dir, diag_payload)
+
+                            # 与模型内部开关无关的路径级定位，给出首个坏掉阶段。
+                            path_diag = _diag_log_feats_path(model, seq, token_type, seq_feat, seq_ts)
+                            _stage_log(
+                                f"[ForwardDiagPath] step={global_step} first_bad_stage={path_diag.get('first_bad_stage')}"
+                            )
+                            _dump_step_debug(step_debug_dir, {
+                                "global_step": global_step,
+                                "epoch": epoch,
+                                "step": step,
+                                "phase": "non_finite_log_feats_path_diag",
+                                "lr": float(optimizer.param_groups[0]['lr']),
+                                "temperature": float(args.temperature),
+                                "ssl_alpha": float(args.ssl_alpha),
+                                **path_diag,
+                            })
                     except Exception as e:
                         _stage_log(f"[ForwardDiag] 二次定位流程失败: {e}")
 
