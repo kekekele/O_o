@@ -5,6 +5,7 @@ import math
 import time
 import random
 import traceback
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -592,6 +593,13 @@ if __name__ == '__main__':
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(runtime_device)
     _stage_log("模型构建并搬运到设备完成")
+    try:
+        _stage_log(
+            f"模型来源: class={model.__class__.__module__}.{model.__class__.__name__}, "
+            f"file={inspect.getfile(model.__class__)}"
+        )
+    except Exception as e:
+        _stage_log(f"模型来源打印失败: {e}")
 
     # 加载全局 logQ（供难样本修正）
     device_t = runtime_device
@@ -825,6 +833,10 @@ if __name__ == '__main__':
 
                     # 自动二次定位：在同一 batch 上开启模型层级有限性检查，抓到首个出错阶段。
                     try:
+                        _stage_log(
+                            f"[ForwardDiag] precheck: has_attr={hasattr(model, 'debug_check_model_finite')}, "
+                            f"flag={getattr(model, 'debug_check_model_finite', 'NA')}"
+                        )
                         if hasattr(model, 'debug_check_model_finite'):
                             prev_flag = bool(model.debug_check_model_finite)
                             prev_training = bool(model.training)
