@@ -270,6 +270,21 @@ def _sanitize_optimizer_state_for_params(optimizer, model, param_names):
         pass
     return reset_states
 
+
+def _is_npu_fatal_error(err) -> bool:
+    s = str(err)
+    keys = [
+        '507015',
+        'aicore exception',
+        'rtKernelLaunchWithHandleV2 failed',
+        'ERR00100',
+        'acl api failed',
+        'copy_between_host_and_device_opapi',
+        'OpExecCache run fail',
+    ]
+    s_low = s.lower()
+    return any(k.lower() in s_low for k in keys)
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -871,6 +886,8 @@ if __name__ == '__main__':
     global_step = 0
     skipped_nonfinite_steps = 0
     step_debug_dir = Path(os.environ.get('TRAIN_LOG_PATH') or "./logs") / "step_debug"
+    fatal_runtime_error = False
+    fatal_runtime_message = ""
 
     if args.inference_only:
         print("Inference only mode enabled. Skip training.")
@@ -878,6 +895,8 @@ if __name__ == '__main__':
         print(f"Start training (AMP: {'on' if amp_enabled else 'off'}, dtype={str(amp_dtype) if amp_enabled else 'fp32'})")
         _stage_log(f"开始训练: amp_enabled={amp_enabled}, amp_dtype={str(amp_dtype) if amp_enabled else 'fp32'}")
         for epoch in range(epoch_start_idx, args.num_epochs + 1):
+            if fatal_runtime_error:
+                break
             model.train()
             epoch_t0 = time.time()
             _stage_log(f"Epoch {epoch} 开始")
@@ -891,6 +910,8 @@ if __name__ == '__main__':
 
             # 训练阶段
             for step, batch in pbar:
+                if fatal_runtime_error:
+                    break
                 step_t0 = time.time()
                 # 兼容包含两条负样本 SSL 视图
                 if isinstance(batch, (list, tuple)) and len(batch) >= 14:
@@ -954,6 +975,19 @@ if __name__ == '__main__':
                         )
                 except Exception as e:
                     _stage_log(f"[Forward] model forward failed at step={global_step}: {e}")
+                    if runtime_device.type == 'npu' and _is_npu_fatal_error(e):
+                        fatal_runtime_error = True
+                        fatal_runtime_message = str(e)
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "npu_fatal_runtime_error",
+                            "error": str(e),
+                            "traceback": traceback.format_exc(),
+                        })
+                        _stage_log("[NPUFatal] 检测到 507015/AICORE 致命异常，停止训练以避免进程段错误")
+                        break
                     bad_params = _scan_nonfinite_params(model)
                     if bad_params:
                         _stage_log(f"[Forward] 前向失败时检测到参数非有限，命中数量(截断)={len(bad_params)}")
@@ -1195,6 +1229,19 @@ if __name__ == '__main__':
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     bad_grads = _scan_nonfinite_grads(model)
+                    if bad_grads and any(_is_npu_fatal_error(x.get('scan_error', '')) for x in bad_grads if isinstance(x, dict)):
+                        fatal_runtime_error = True
+                        fatal_runtime_message = str(bad_grads)
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "npu_fatal_runtime_error",
+                            "error": "fatal npu error during grad scan",
+                            "detail": bad_grads,
+                        })
+                        _stage_log("[NPUFatal] 梯度扫描阶段检测到 507015/AICORE 致命异常，停止训练")
+                        break
                     if bad_grads:
                         skipped_nonfinite_steps += 1
                         _stage_log(
@@ -1219,11 +1266,40 @@ if __name__ == '__main__':
                         scaler.update()
                         continue
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
+                    try:
+                        scaler.step(optimizer)
+                    except Exception as e:
+                        if runtime_device.type == 'npu' and _is_npu_fatal_error(e):
+                            fatal_runtime_error = True
+                            fatal_runtime_message = str(e)
+                            _dump_step_debug(step_debug_dir, {
+                                "global_step": global_step,
+                                "epoch": epoch,
+                                "step": step,
+                                "phase": "npu_fatal_runtime_error",
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                            })
+                            _stage_log("[NPUFatal] optimizer step 阶段检测到 507015/AICORE 致命异常，停止训练")
+                            break
+                        raise
                     scaler.update()
                 else:
                     loss.backward()
                     bad_grads = _scan_nonfinite_grads(model)
+                    if bad_grads and any(_is_npu_fatal_error(x.get('scan_error', '')) for x in bad_grads if isinstance(x, dict)):
+                        fatal_runtime_error = True
+                        fatal_runtime_message = str(bad_grads)
+                        _dump_step_debug(step_debug_dir, {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step": step,
+                            "phase": "npu_fatal_runtime_error",
+                            "error": "fatal npu error during grad scan",
+                            "detail": bad_grads,
+                        })
+                        _stage_log("[NPUFatal] 梯度扫描阶段检测到 507015/AICORE 致命异常，停止训练")
+                        break
                     if bad_grads:
                         skipped_nonfinite_steps += 1
                         _stage_log(
@@ -1247,7 +1323,26 @@ if __name__ == '__main__':
                         optimizer.zero_grad(set_to_none=True)
                         continue
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    try:
+                        optimizer.step()
+                    except Exception as e:
+                        if runtime_device.type == 'npu' and _is_npu_fatal_error(e):
+                            fatal_runtime_error = True
+                            fatal_runtime_message = str(e)
+                            _dump_step_debug(step_debug_dir, {
+                                "global_step": global_step,
+                                "epoch": epoch,
+                                "step": step,
+                                "phase": "npu_fatal_runtime_error",
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                            })
+                            _stage_log("[NPUFatal] optimizer step 阶段检测到 507015/AICORE 致命异常，停止训练")
+                            break
+                        raise
+
+                if fatal_runtime_error:
+                    break
 
                 scheduler.step()
 
@@ -1320,6 +1415,9 @@ if __name__ == '__main__':
 
                 global_step += 1
 
+            if fatal_runtime_error:
+                break
+
             # ===== 验证：HR@10、NDCG@10、score =====
             val_dict = evaluate_hr_ndcg10_and_score(
                 model, val_loader, device=runtime_device,
@@ -1358,6 +1456,9 @@ if __name__ == '__main__':
                 if epochs_no_improve >= 2:
                     print(f"Early stopping triggered after {epoch} epochs. Best score={best_score:.6f}")
                     break
+
+    if fatal_runtime_error:
+        raise RuntimeError(f"NPU fatal runtime error detected, training stopped safely: {fatal_runtime_message}")
 
     print("Done")
     writer.close()
