@@ -253,7 +253,7 @@ def _sanitize_nonfinite_params(model, max_items: int = 20):
 
 
 def _sanitize_optimizer_state_for_params(optimizer, model, param_names):
-    fixed_states = []
+    reset_states = []
     try:
         name_to_param = {n: p for n, p in model.named_parameters()}
         for name in param_names:
@@ -263,18 +263,12 @@ def _sanitize_optimizer_state_for_params(optimizer, model, param_names):
             st = optimizer.state.get(p, None)
             if not isinstance(st, dict):
                 continue
-            touched = False
-            for k, v in st.items():
-                if torch.is_tensor(v) and v.dtype.is_floating_point:
-                    if not torch.isfinite(v).all().item():
-                        with torch.no_grad():
-                            v.copy_(torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0))
-                        touched = True
-            if touched:
-                fixed_states.append(name)
+            # 参数已被修复后，直接清空该参数的优化器状态，避免陈旧动量再次污染参数。
+            st.clear()
+            reset_states.append(name)
     except Exception:
         pass
-    return fixed_states
+    return reset_states
 
 def get_args():
     parser = argparse.ArgumentParser()
